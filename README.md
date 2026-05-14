@@ -80,7 +80,8 @@ Merge another causal log or `{ vertices, edges }` object. Vertices are unioned b
 
 #### `const commitment = log.commitment()`
 
-Return the compressed full graph commitment as a `Buffer`.
+Return the compressed full graph commitment as a `Buffer`. Pending dirty
+buckets are finalized before the commitment is returned.
 
 #### `const commitment = log.vertexCommitment()`
 
@@ -98,7 +99,7 @@ without scanning the dense graph coordinate space.
 
 #### `const state = log.state()`
 
-Return:
+Finalize pending dirty buckets and return:
 
 ```js
 {
@@ -194,3 +195,12 @@ The point commitment keeps the clean additive graph algebra, while
 by unioning bucket elements and recomputing bucket polynomial commitments. This
 gives compact IPA membership openings, but it is not an additive accumulator for
 set union.
+
+Singleton buckets use a cheaper path: the bucket digest is the element scalar
+itself, and membership verification only needs the sparse coordinate opening.
+Buckets with multiple elements use the IPA polynomial set-membership proof.
+
+Mutations are cheap until a cryptographic read boundary. `addVertex()` and
+`addEdge()` update in-memory sets and mark affected buckets dirty; calls such as
+`commitment()`, `state()`, `proveVertex()`, `proveEdge()`, and `toJSON()`
+finalize dirty bucket commitments before returning.

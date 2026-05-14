@@ -520,6 +520,40 @@ function vertexBucketPolynomial (rank, values) {
   }
 }
 
+function vertexBucketState (rank, values) {
+  rank = validateRank(rank)
+  if (!Array.isArray(values) || values.length === 0) throw new Error('vertex bucket must contain at least one vertex')
+
+  const unique = new Map()
+  for (const value of values) {
+    const bytes = normalizeBytes(value)
+    unique.set(valueKey(bytes), bytes)
+  }
+
+  const bucketValues = [...unique.values()]
+  if (bucketValues.length === 1) {
+    const value = b4a.from(bucketValues[0])
+    const digest = elementScalarForVertex(rank, value)
+
+    return {
+      kind: 'singleton',
+      rank,
+      values: [value],
+      roots: [digest],
+      coeffs: null,
+      commitment: null,
+      digest,
+      degree: 1
+    }
+  }
+
+  return vertexBucketPolynomial(rank, bucketValues)
+}
+
+function vertexBucketDigest (rank, values) {
+  return vertexBucketState(rank, values).digest
+}
+
 function edgeBucketCommitment (fromRank, toRank, edges) {
   fromRank = validateRank(fromRank)
   toRank = validateRank(toRank)
@@ -578,12 +612,58 @@ function edgeBucketPolynomial (fromRank, toRank, edges) {
   }
 }
 
+function edgeBucketState (fromRank, toRank, edges) {
+  fromRank = validateRank(fromRank)
+  toRank = validateRank(toRank)
+  if (toRank <= fromRank) throw new Error('edge bucket must point to a later rank')
+  if (!Array.isArray(edges) || edges.length === 0) throw new Error('edge bucket must contain at least one edge')
+
+  const unique = new Map()
+  for (const edge of edges) {
+    const from = normalizeBytes(edge.from, 'from')
+    const to = normalizeBytes(edge.to, 'to')
+    const edgeFromRank = validateRank(edge.fromRank)
+    const edgeToRank = validateRank(edge.toRank)
+    if (edgeFromRank !== fromRank || edgeToRank !== toRank) throw new Error('edge does not belong to bucket')
+    unique.set(edgeKey(fromRank, from, toRank, to), { fromRank, from, toRank, to })
+  }
+
+  const bucketEdges = [...unique.values()]
+  if (bucketEdges.length === 1) {
+    const edge = bucketEdges[0]
+    const digest = elementScalarForEdge(edge.fromRank, edge.from, edge.toRank, edge.to)
+
+    return {
+      kind: 'singleton',
+      fromRank,
+      toRank,
+      edges: [{
+        fromRank: edge.fromRank,
+        from: b4a.from(edge.from),
+        toRank: edge.toRank,
+        to: b4a.from(edge.to)
+      }],
+      roots: [digest],
+      coeffs: null,
+      commitment: null,
+      digest,
+      degree: 1
+    }
+  }
+
+  return edgeBucketPolynomial(fromRank, toRank, bucketEdges)
+}
+
+function edgeBucketDigest (fromRank, toRank, edges) {
+  return edgeBucketState(fromRank, toRank, edges).digest
+}
+
 function vertexBucketScalar (rank, values) {
-  return bucketDigest(vertexBucketCommitment(rank, values))
+  return vertexBucketDigest(rank, values)
 }
 
 function edgeBucketScalar (fromRank, toRank, edges) {
-  return bucketDigest(edgeBucketCommitment(fromRank, toRank, edges))
+  return edgeBucketDigest(fromRank, toRank, edges)
 }
 
 function termForEdgeBucket (fromRank, toRank, edges) {
@@ -893,6 +973,8 @@ class CausalLog {
     this._coordinates = new Map()
     this._coordinateRoot = coordinateEmptyRoot()
     this._coordinateRootDirty = false
+    this._dirtyVertexBuckets = new Set()
+    this._dirtyEdgeBuckets = new Set()
     this._vertexCommitment = ZERO
     this._edgeCommitment = ZERO
     this._edges = new Map()
@@ -974,7 +1056,7 @@ class CausalLog {
     this.maxRank = Math.max(this.maxRank, rank)
     this.vertexCount++
     this.byteLength += bytes.length
-    this._updateVertexCommitment(rank, bytes)
+    this._markVertexBucketDirty(rank)
 
     return { rank, value: b4a.from(bytes), added: true }
   }
@@ -1002,7 +1084,7 @@ class CausalLog {
 
     const edge = { fromRank, from: b4a.from(from), toRank, to: b4a.from(to) }
     bucket.edges.set(key, edge)
-    this._updateEdgeCommitment(bucket, edge)
+    this._markEdgeBucketDirty(bucketKey)
 
     return { ...edge, added: true }
   }
@@ -1092,14 +1174,17 @@ class CausalLog {
   }
 
   commitmentPoint () {
+    this._finalizeDirtyBuckets()
     return ptAdd(this._vertexCommitment, this._edgeCommitment)
   }
 
   vertexCommitmentPoint () {
+    this._finalizeDirtyBuckets()
     return this._vertexCommitment
   }
 
   edgeCommitmentPoint () {
+    this._finalizeDirtyBuckets()
     return this._edgeCommitment
   }
 
@@ -1108,14 +1193,17 @@ class CausalLog {
   }
 
   vertexCommitment () {
+    this._finalizeDirtyBuckets()
     return b4a.from(ptToBytes(this._vertexCommitment))
   }
 
   edgeCommitment () {
+    this._finalizeDirtyBuckets()
     return b4a.from(ptToBytes(this._edgeCommitment))
   }
 
   coordinateRoot () {
+    this._finalizeDirtyBuckets()
     if (this._coordinateRootDirty) {
       this._coordinateRoot = coordinateRootFromMap(this._coordinates)
       this._coordinateRootDirty = false
@@ -1143,16 +1231,20 @@ class CausalLog {
       throw new Error('vertex is not present in causal log')
     }
 
+    this._finalizeDirtyBuckets()
     const bucket = this._vertexBuckets.get(rank)
     const z = elementScalarForVertex(rank, target)
     const coordinateOpening = coordinateOpeningFromMap(this._coordinates, rank, rank)
-    const innerOpening = ipaProvePolynomialEvaluation(rank, rank, bucket.coeffs, z, 0n)
+    const innerOpening = bucket.kind === 'singleton'
+      ? null
+      : ipaProvePolynomialEvaluation(rank, rank, bucket.coeffs, z, 0n)
 
     return {
       type: 'hyperdag-vertex-membership-proof-v1',
       rank,
       value: b4a.from(target),
-      bucketCommitment: b4a.from(ptToBytes(bucket.commitment)),
+      bucketKind: bucket.kind || 'polynomial',
+      bucketCommitment: bucket.commitment && b4a.from(ptToBytes(bucket.commitment)),
       bucketDigest: bucket.digest,
       coordinateOpening,
       innerOpening,
@@ -1172,16 +1264,20 @@ class CausalLog {
       throw new Error('edge is not present in causal log')
     }
 
+    this._finalizeDirtyBuckets()
     const bucket = this._edges.get(coordinateKey(fromRank, toRank))
     const z = elementScalarForEdge(fromRank, from, toRank, to)
     const coordinateOpening = coordinateOpeningFromMap(this._coordinates, fromRank, toRank)
-    const innerOpening = ipaProvePolynomialEvaluation(fromRank, toRank, bucket.coeffs, z, 0n)
+    const innerOpening = bucket.kind === 'singleton'
+      ? null
+      : ipaProvePolynomialEvaluation(fromRank, toRank, bucket.coeffs, z, 0n)
 
     return {
       type: 'hyperdag-edge-membership-proof-v1',
       coordinate: { fromRank, toRank },
       edge: { from: b4a.from(from), to: b4a.from(to) },
-      bucketCommitment: b4a.from(ptToBytes(bucket.commitment)),
+      bucketKind: bucket.kind || 'polynomial',
+      bucketCommitment: bucket.commitment && b4a.from(ptToBytes(bucket.commitment)),
       bucketDigest: bucket.digest,
       coordinateOpening,
       innerOpening,
@@ -1229,31 +1325,12 @@ class CausalLog {
     }
   }
 
-  _updateVertexCommitment (rank, value) {
-    const oldBucket = this._vertexBuckets.get(rank)
-    const newBucket = appendBucketRoot(rank, rank, oldBucket, elementScalarForVertex(rank, value))
-    const oldDigest = oldBucket ? oldBucket.digest : 0n
-
-    this._vertexBuckets.set(rank, newBucket)
-    this._vertexCommitment = applyCoordinateDelta(this._vertexCommitment, rank, rank, oldDigest, newBucket.digest)
-    this._updateCoordinateRoot(rank, rank, newBucket.digest)
+  _markVertexBucketDirty (rank) {
+    this._dirtyVertexBuckets.add(rank)
   }
 
-  _updateEdgeCommitment (bucket, edge) {
-    const oldDigest = bucket.digest || 0n
-    const next = appendBucketRoot(
-      bucket.fromRank,
-      bucket.toRank,
-      bucket,
-      elementScalarForEdge(edge.fromRank, edge.from, edge.toRank, edge.to)
-    )
-
-    bucket.coeffs = next.coeffs
-    bucket.commitment = next.commitment
-    bucket.digest = next.digest
-    bucket.degree = next.degree
-    this._edgeCommitment = applyCoordinateDelta(this._edgeCommitment, bucket.fromRank, bucket.toRank, oldDigest, bucket.digest)
-    this._updateCoordinateRoot(bucket.fromRank, bucket.toRank, bucket.digest)
+  _markEdgeBucketDirty (bucketKey) {
+    this._dirtyEdgeBuckets.add(bucketKey)
   }
 
   _updateCoordinateRoot (i, j, digest) {
@@ -1261,7 +1338,52 @@ class CausalLog {
     this._coordinateRootDirty = true
   }
 
+  _finalizeDirtyBuckets () {
+    if (this._dirtyVertexBuckets.size === 0 && this._dirtyEdgeBuckets.size === 0) return
+
+    for (const rank of [...this._dirtyVertexBuckets].sort((a, b) => a - b)) {
+      const layer = this._layers.get(rank)
+      if (!layer || layer.size === 0) continue
+
+      const oldBucket = this._vertexBuckets.get(rank)
+      const oldDigest = oldBucket ? oldBucket.digest : 0n
+      const next = vertexBucketState(rank, [...layer.values()])
+
+      this._vertexBuckets.set(rank, next)
+      this._vertexCommitment = applyCoordinateDelta(this._vertexCommitment, rank, rank, oldDigest, next.digest)
+      this._updateCoordinateRoot(rank, rank, next.digest)
+    }
+
+    const dirtyEdgeBuckets = [...this._dirtyEdgeBuckets]
+      .map(key => this._edges.get(key))
+      .filter(Boolean)
+      .sort((a, b) => {
+        if (a.fromRank !== b.fromRank) return a.fromRank - b.fromRank
+        return a.toRank - b.toRank
+      })
+
+    for (const bucket of dirtyEdgeBuckets) {
+      if (bucket.edges.size === 0) continue
+
+      const oldDigest = bucket.digest || 0n
+      const next = edgeBucketState(bucket.fromRank, bucket.toRank, [...bucket.edges.values()])
+
+      bucket.roots = next.roots
+      bucket.coeffs = next.coeffs
+      bucket.commitment = next.commitment
+      bucket.digest = next.digest
+      bucket.degree = next.degree
+      bucket.kind = next.kind
+      this._edgeCommitment = applyCoordinateDelta(this._edgeCommitment, bucket.fromRank, bucket.toRank, oldDigest, bucket.digest)
+      this._updateCoordinateRoot(bucket.fromRank, bucket.toRank, bucket.digest)
+    }
+
+    this._dirtyVertexBuckets.clear()
+    this._dirtyEdgeBuckets.clear()
+  }
+
   _recomputeCommitments () {
+    this._finalizeDirtyBuckets()
     this._vertexCommitment = commitmentForVertices(this.vertices())
     this._edgeCommitment = commitmentForEdges(this.edges())
     this._coordinates = new Map()
@@ -1333,13 +1455,24 @@ class CausalLog {
       const stateCheck = verifyStateSlices(expected)
       if (!stateCheck.valid) return stateCheck
 
-      const bucketCommitment = ptFromBytes(proof.bucketCommitment)
-      const digest = bucketDigest(bucketCommitment)
+      const bucketKind = proof.bucketKind || 'polynomial'
+      let bucketCommitment = null
+      let digest = null
+
+      if (bucketKind === 'singleton') {
+        digest = elementScalarForVertex(rank, value)
+      } else if (bucketKind === 'polynomial') {
+        bucketCommitment = ptFromBytes(proof.bucketCommitment)
+        digest = bucketDigest(bucketCommitment)
+      } else {
+        return { valid: false, reason: 'unsupported bucket kind' }
+      }
+
       if (proof.bucketDigest !== undefined && !sameScalar(proof.bucketDigest, digest)) {
         return { valid: false, reason: 'bucket digest mismatch' }
       }
 
-      if (proof.degree !== undefined && proof.innerOpening.length !== nextPow2(proof.degree + 1)) {
+      if (bucketKind === 'polynomial' && proof.degree !== undefined && proof.innerOpening.length !== nextPow2(proof.degree + 1)) {
         return { valid: false, reason: 'invalid bucket proof dimension' }
       }
 
@@ -1356,15 +1489,19 @@ class CausalLog {
       )
       if (!coordinate.valid) return coordinate
 
-      const inner = ipaVerifyPolynomialEvaluation(
-        rank,
-        rank,
-        bucketCommitment,
-        elementScalarForVertex(rank, value),
-        0n,
-        proof.innerOpening
-      )
-      if (!inner.valid) return inner
+      if (bucketKind === 'polynomial') {
+        const inner = ipaVerifyPolynomialEvaluation(
+          rank,
+          rank,
+          bucketCommitment,
+          elementScalarForVertex(rank, value),
+          0n,
+          proof.innerOpening
+        )
+        if (!inner.valid) return inner
+      } else if (proof.innerOpening !== null && proof.innerOpening !== undefined) {
+        return { valid: false, reason: 'singleton proof must not include inner opening' }
+      }
 
       return { valid: true, reason: 'OK' }
     } catch (err) {
@@ -1401,13 +1538,24 @@ class CausalLog {
       const stateCheck = verifyStateSlices(expected)
       if (!stateCheck.valid) return stateCheck
 
-      const bucketCommitment = ptFromBytes(proof.bucketCommitment)
-      const digest = bucketDigest(bucketCommitment)
+      const bucketKind = proof.bucketKind || 'polynomial'
+      let bucketCommitment = null
+      let digest = null
+
+      if (bucketKind === 'singleton') {
+        digest = elementScalarForEdge(fromRank, from, toRank, to)
+      } else if (bucketKind === 'polynomial') {
+        bucketCommitment = ptFromBytes(proof.bucketCommitment)
+        digest = bucketDigest(bucketCommitment)
+      } else {
+        return { valid: false, reason: 'unsupported bucket kind' }
+      }
+
       if (proof.bucketDigest !== undefined && !sameScalar(proof.bucketDigest, digest)) {
         return { valid: false, reason: 'bucket digest mismatch' }
       }
 
-      if (proof.degree !== undefined && proof.innerOpening.length !== nextPow2(proof.degree + 1)) {
+      if (bucketKind === 'polynomial' && proof.degree !== undefined && proof.innerOpening.length !== nextPow2(proof.degree + 1)) {
         return { valid: false, reason: 'invalid bucket proof dimension' }
       }
 
@@ -1424,15 +1572,19 @@ class CausalLog {
       )
       if (!coordinateOpening.valid) return coordinateOpening
 
-      const inner = ipaVerifyPolynomialEvaluation(
-        fromRank,
-        toRank,
-        bucketCommitment,
-        elementScalarForEdge(fromRank, from, toRank, to),
-        0n,
-        proof.innerOpening
-      )
-      if (!inner.valid) return inner
+      if (bucketKind === 'polynomial') {
+        const inner = ipaVerifyPolynomialEvaluation(
+          fromRank,
+          toRank,
+          bucketCommitment,
+          elementScalarForEdge(fromRank, from, toRank, to),
+          0n,
+          proof.innerOpening
+        )
+        if (!inner.valid) return inner
+      } else if (proof.innerOpening !== null && proof.innerOpening !== undefined) {
+        return { valid: false, reason: 'singleton proof must not include inner opening' }
+      }
 
       return { valid: true, reason: 'OK' }
     } catch (err) {
@@ -1464,7 +1616,9 @@ module.exports = {
     edgeScalar,
     edgeBucketScalar,
     edgeBucketCommitment,
+    edgeBucketDigest,
     edgeBucketPolynomial,
+    edgeBucketState,
     evaluatePolynomial,
     evaluationBasis,
     fmod,
@@ -1498,6 +1652,8 @@ module.exports = {
     termForEdgeBucket,
     vertexBucketScalar,
     vertexBucketCommitment,
+    vertexBucketDigest,
+    vertexBucketState,
     vertexBucketPolynomial,
     verifyCoordinateOpening
   }

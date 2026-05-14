@@ -7,6 +7,7 @@ const {
   commitmentForVertices,
   coordinateRootFromEntries,
   edgeBucketCommitment,
+  edgeBucketDigest,
   elementScalarForEdge,
   elementScalarForVertex,
   evaluatePolynomial,
@@ -23,6 +24,7 @@ const {
   rootPolynomial,
   termForVertexBucket,
   termForEdgeBucket,
+  vertexBucketDigest,
   vertexBucketCommitment
 } = _internals
 const b4a = require('b4a')
@@ -78,7 +80,7 @@ function expectedCoordinateRoot (log) {
     entries.push({
       i: rank,
       j: rank,
-      digest: bucketDigest(vertexBucketCommitment(rank, log.layer(rank)))
+      digest: vertexBucketDigest(rank, log.layer(rank))
     })
   }
 
@@ -88,7 +90,7 @@ function expectedCoordinateRoot (log) {
     entries.push({
       i: fromRank,
       j: toRank,
-      digest: bucketDigest(edgeBucketCommitment(fromRank, toRank, log.edgeBucket(fromRank, toRank)))
+      digest: edgeBucketDigest(fromRank, toRank, log.edgeBucket(fromRank, toRank))
     })
   }
 
@@ -253,6 +255,46 @@ test('incremental commitments match full recomputation after mixed mutations', (
   assertBufferEqual(log.coordinateRoot(), expectedCoordinateRoot(log))
 })
 
+test('mutations finalize dirty buckets lazily at read boundaries', () => {
+  const log = new CausalLog()
+
+  log.addVertex(1, b('a'))
+  log.addVertex(1, b('b'))
+  log.addEdge(1, b('a'), 3, b('c'))
+
+  assert(log._dirtyVertexBuckets.size > 0, 'vertex buckets should be dirty before a read boundary')
+  assert(log._dirtyEdgeBuckets.size > 0, 'edge buckets should be dirty before a read boundary')
+  assertEqual(log._vertexBuckets.size, 0, 'vertex buckets should not finalize eagerly')
+
+  const state = log.state()
+
+  assertEqual(log._dirtyVertexBuckets.size, 0, 'state() should finalize dirty vertex buckets')
+  assertEqual(log._dirtyEdgeBuckets.size, 0, 'state() should finalize dirty edge buckets')
+  assertBufferEqual(state.commitment, log.commitment())
+  assertBufferEqual(log.vertexCommitment(), ptToBytes(commitmentForVertices(log.vertices())))
+  assertBufferEqual(log.edgeCommitment(), ptToBytes(commitmentForEdges(log.edges())))
+  assertBufferEqual(log.coordinateRoot(), expectedCoordinateRoot(log))
+})
+
+test('interleaved mutation and proof generation finalizes only when needed', () => {
+  const log = new CausalLog()
+
+  log.append(b('a'))
+  assert(log._dirtyVertexBuckets.size > 0, 'append should leave vertex bucket dirty')
+
+  const firstProof = log.proveVertex({ rank: 1, value: b('a') })
+  valid(CausalLog.verifyVertex(log.state(), firstProof))
+  assertEqual(log._dirtyVertexBuckets.size, 0, 'proveVertex should finalize dirty buckets')
+
+  log.append(b('b'))
+  assert(log._dirtyVertexBuckets.size > 0 || log._dirtyEdgeBuckets.size > 0, 'later append should dirty buckets again')
+
+  const edgeProof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
+  valid(CausalLog.verifyEdge(log.state(), edgeProof))
+  assertEqual(log._dirtyVertexBuckets.size, 0)
+  assertEqual(log._dirtyEdgeBuckets.size, 0)
+})
+
 test('explicit edges can occupy non-adjacent coordinate buckets', () => {
   const log = new CausalLog()
   log.addEdge(1, b('a'), 3, b('d'))
@@ -405,6 +447,13 @@ test('bucket digest is derived from bucket commitment', () => {
   assert(digest !== 0n, 'bucket digest should be a non-zero-looking scalar')
 })
 
+test('singleton bucket digest is the element scalar', () => {
+  assertEqual(vertexBucketDigest(1, [b('a')]), elementScalarForVertex(1, b('a')))
+  assertEqual(edgeBucketDigest(1, 2, [
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('b') }
+  ]), elementScalarForEdge(1, b('a'), 2, b('b')))
+})
+
 test('vertex bucket commitment dedupes duplicate elements', () => {
   const withDupes = vertexBucketCommitment(1, [b('a'), b('a'), b('b')])
   const deduped = vertexBucketCommitment(1, [b('a'), b('b')])
@@ -450,6 +499,17 @@ test('valid vertex proof verifies against expected state', () => {
   valid(log.verifyVertex(proof))
 })
 
+test('singleton vertex proof verifies without inner IPA', () => {
+  const log = new CausalLog()
+  log.append(b('a'))
+
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
+
+  assertEqual(proof.bucketKind, 'singleton')
+  assertEqual(proof.innerOpening, null)
+  valid(CausalLog.verifyVertex(log.state(), proof))
+})
+
 test('vertex proof for a degenerate layer verifies without complements', () => {
   const log = new CausalLog()
   log.append(b('a'))
@@ -476,6 +536,17 @@ test('valid edge proof verifies against expected state', () => {
   assertEqual(proof.degree, 2)
   valid(CausalLog.verifyEdge(log.state(), proof))
   valid(log.verifyEdge(proof))
+})
+
+test('singleton edge proof verifies without inner IPA', () => {
+  const log = new CausalLog()
+  log.addBranch([b('a'), b('b')])
+
+  const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
+
+  assertEqual(proof.bucketKind, 'singleton')
+  assertEqual(proof.innerOpening, null)
+  valid(CausalLog.verifyEdge(log.state(), proof))
 })
 
 test('non-adjacent edge proof verifies against expected state', () => {
@@ -521,6 +592,7 @@ test('edge proof rejects wrong coordinate', () => {
 test('edge proof rejects wrong bucket commitment', () => {
   const log = new CausalLog()
   log.addBranch([b('a'), b('b'), b('d')])
+  log.addBranch([b('a'), b('c'), b('d')])
 
   const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
   proof.bucketCommitment = ptToBytes(vertexBucketCommitment(1, [b('x')]))
@@ -531,8 +603,9 @@ test('edge proof rejects wrong bucket commitment', () => {
 test('vertex proof rejects wrong bucket commitment', () => {
   const log = new CausalLog()
   log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
 
-  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  const proof = log.proveVertex({ rank: 2, value: b('b') })
   proof.bucketCommitment = ptToBytes(vertexBucketCommitment(1, [b('x')]))
 
   invalid(CausalLog.verifyVertex(log.state(), proof))
@@ -650,9 +723,9 @@ test('mutated proof value fails', () => {
 test('mutated IPA opening fails', () => {
   const log = new CausalLog()
   log.append(b('a'))
-  log.append(b('b'))
+  log.appendLayer([b('b'), b('c')])
 
-  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  const proof = log.proveVertex({ rank: 2, value: b('b') })
   proof.innerOpening.finalScalar = fmod(proof.innerOpening.finalScalar + 1n)
 
   invalid(CausalLog.verifyVertex(log.state(), proof))

@@ -2,7 +2,7 @@
   "name": "causal-log",
   "version": "0.0.1",
   "description": "An append-only, multiply-branched log.",
-  "license": "0BSD",
+  "license": "CC0",
   "author": "Luke Burns",
   "type": "commonjs",
   "main": "index.js",
