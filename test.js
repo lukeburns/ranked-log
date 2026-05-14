@@ -12,6 +12,7 @@ const {
   termForEntry,
   termForLayer
 } = require('./index')
+const b4a = require('b4a')
 
 let passed = 0
 let failed = 0
@@ -37,11 +38,11 @@ function assertEqual (actual, expected, message) {
 }
 
 function assertBufferEqual (actual, expected, message) {
-  assert(Buffer.from(actual).equals(Buffer.from(expected)), message || 'buffers differ')
+  assert(b4a.from(actual).equals(b4a.from(expected)), message || 'buffers differ')
 }
 
 function assertBufferNotEqual (actual, expected, message) {
-  assert(!Buffer.from(actual).equals(Buffer.from(expected)), message || 'buffers should differ')
+  assert(!b4a.from(actual).equals(b4a.from(expected)), message || 'buffers should differ')
 }
 
 function valid (result, message) {
@@ -53,7 +54,7 @@ function invalid (result, message) {
 }
 
 function b (value) {
-  return Buffer.from(value)
+  return b4a.from(value)
 }
 
 console.log('\n── Suite 1: Ranked Log Basics ──────────────────────────')
@@ -65,7 +66,7 @@ test('empty log has zero state', () => {
   assertEqual(state.maxRank, 0)
   assertEqual(state.entryCount, 0)
   assertEqual(state.byteLength, 0)
-  assertEqual(state.commitment.length, 33)
+  assertEqual(state.commitment.length, 32)
   assert(state.commitment.every(byte => byte === 0), 'empty commitment should be zero point')
 })
 
@@ -219,12 +220,27 @@ console.log('\n── Suite 3: Unsigned Entry Verification ───────
 test('valid entry proof verifies against expected state', () => {
   const log = new RankedLog()
   log.append(b('a'))
-  log.appendLayer([b('b'), b('c')])
+  log.append(b('b'))
   log.append(b('d'))
 
   const proof = log.proveEntry({ rank: 2, value: b('b') })
   valid(RankedLog.verifyEntry(log.state(), proof))
   valid(log.verifyEntry(proof))
+})
+
+test('entry proofs reject non-linear layers for now', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
+
+  let threw = false
+  try {
+    log.proveEntry({ rank: 2, value: b('b') })
+  } catch {
+    threw = true
+  }
+
+  assert(threw, 'degenerate layer membership proofs are not implemented yet')
 })
 
 test('proof does not verify against a different commitment', () => {
@@ -273,13 +289,13 @@ test('mutated proof value fails', () => {
   invalid(RankedLog.verifyEntry(log.state(), proof))
 })
 
-test('mutated witness value fails', () => {
+test('mutated IPA opening fails', () => {
   const log = new RankedLog()
   log.append(b('a'))
   log.append(b('b'))
 
   const proof = log.proveEntry({ rank: 1, value: b('a') })
-  proof.layers[0].values[0] = b('x')
+  proof.opening.finalScalar = proof.opening.finalScalar + 1n
 
   invalid(RankedLog.verifyEntry(log.state(), proof))
 })
@@ -321,9 +337,9 @@ test('toJSON / fromJSON round trip preserves state', () => {
 test('restored log verifies original proof', () => {
   const log = new RankedLog()
   log.append(b('a'))
-  log.appendLayer([b('b'), b('c')])
+  log.append(b('b'))
 
-  const proof = log.proveEntry({ rank: 2, value: b('c') })
+  const proof = log.proveEntry({ rank: 2, value: b('b') })
   const restored = RankedLog.fromJSON(log.toJSON())
 
   valid(restored.verifyEntry(proof))
@@ -334,7 +350,7 @@ test('fromJSON rejects mismatched commitment', () => {
   log.append(b('a'))
 
   const json = log.toJSON()
-  json.commitment = Buffer.from(generator(1).toBytes()).toString('hex')
+  json.commitment = b4a.from(generator(1).toBytes()).toString('hex')
 
   let threw = false
   try {

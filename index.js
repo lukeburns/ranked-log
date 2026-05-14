@@ -2,27 +2,30 @@
 
 const { sha256 } = require('@noble/hashes/sha2.js')
 const { bytesToHex, hexToBytes } = require('@noble/hashes/utils.js')
-const { bn254 } = require('@noble/curves/bn254.js')
+const { ristretto255 } = require('@noble/curves/ed25519.js')
+const b4a = require('b4a')
 
-const Fr = bn254.fields.Fr
-const G1Point = bn254.G1.Point
-const ZERO = G1Point.ZERO
-const POINT_SIZE = 33
+const Point = ristretto255.Point
+const Fr = Point.Fn
+const ZERO = Point.ZERO
+const POINT_SIZE = 32
 
-const DOMAIN_ENTRY = Buffer.from('hyperdag:entry:v1')
-const DOMAIN_GENERATOR = Buffer.from('hyperdag:rank-generator:v1')
-const DOMAIN_SCALAR = Buffer.from('hyperdag:scalar:v1')
+const DOMAIN_ENTRY = b4a.from('hyperdag:entry:v1')
+const DOMAIN_GENERATOR = b4a.from('hyperdag:rank-generator:v1')
+const DOMAIN_INNER_PRODUCT = b4a.from('hyperdag:inner-product-generator:v1')
+const DOMAIN_SCALAR = b4a.from('hyperdag:scalar:v1')
+const DOMAIN_CHALLENGE = b4a.from('hyperdag:challenge:v1')
 
 function uint64be (n) {
-  const b = Buffer.allocUnsafe(8)
+  const b = b4a.allocUnsafe(8)
   b.writeBigUInt64BE(BigInt(n))
   return b
 }
 
 function normalizeBytes (value, name = 'value') {
-  if (Buffer.isBuffer(value)) return Buffer.from(value)
-  if (value instanceof Uint8Array) return Buffer.from(value)
-  if (typeof value === 'string') return Buffer.from(value)
+  if (b4a.isBuffer(value)) return b4a.from(value)
+  if (value instanceof Uint8Array) return b4a.from(value)
+  if (typeof value === 'string') return b4a.from(value)
   throw new TypeError(`${name} must be a Buffer, Uint8Array, or string`)
 }
 
@@ -43,7 +46,7 @@ function modinv (a) {
 
 function hashToScalar (value, domain = DOMAIN_SCALAR) {
   const bytes = normalizeBytes(value)
-  const input = Buffer.concat([domain, uint64be(bytes.length), bytes])
+  const input = b4a.concat([domain, uint64be(bytes.length), bytes])
   return fmod(BigInt('0x' + bytesToHex(sha256(input))))
 }
 
@@ -52,6 +55,7 @@ function hashEntry (value) {
 }
 
 const genCache = new Map()
+let innerProductGenerator = null
 
 function generator (rank) {
   validateRank(rank)
@@ -59,9 +63,15 @@ function generator (rank) {
   if (cached) return cached
 
   const seed = hashToScalar(uint64be(rank), DOMAIN_GENERATOR)
-  const point = G1Point.BASE.multiply(seed)
+  const point = Point.BASE.multiply(seed)
   genCache.set(rank, point)
   return point
+}
+
+function ipaGenerator () {
+  if (innerProductGenerator) return innerProductGenerator
+  innerProductGenerator = Point.BASE.multiply(hashToScalar('u', DOMAIN_INNER_PRODUCT))
+  return innerProductGenerator
 }
 
 function ptAdd (P, Q) {
@@ -69,7 +79,8 @@ function ptAdd (P, Q) {
 }
 
 function ptScale (s, P) {
-  return P.multiply(fmod(s))
+  const scalar = fmod(s)
+  return scalar === 0n ? ZERO : P.multiply(scalar)
 }
 
 function ptEq (P, Q) {
@@ -85,20 +96,47 @@ function ptFromBytes (bytes) {
   const b = normalizeBytes(bytes, 'point')
   if (b.length !== POINT_SIZE) throw new Error(`point must be ${POINT_SIZE} bytes`)
   if (b.every(byte => byte === 0)) return ZERO
-  return G1Point.fromHex(bytesToHex(b))
+  return Point.fromHex(bytesToHex(b))
 }
 
 function entryKey (bytes) {
   return bytesToHex(bytes)
 }
 
+function challenge (...args) {
+  const parts = [DOMAIN_CHALLENGE]
+
+  for (const arg of args) {
+    if (typeof arg === 'bigint') {
+      parts.push(b4a.from('bigint'))
+      parts.push(b4a.from(arg.toString(16)))
+    } else if (typeof arg === 'number') {
+      parts.push(b4a.from('number'))
+      parts.push(uint64be(arg))
+    } else if (arg && typeof arg.toBytes === 'function') {
+      const bytes = b4a.from(ptToBytes(arg))
+      parts.push(b4a.from('point'))
+      parts.push(uint64be(bytes.length))
+      parts.push(bytes)
+    } else {
+      const bytes = normalizeBytes(arg, 'challenge argument')
+      parts.push(b4a.from('bytes'))
+      parts.push(uint64be(bytes.length))
+      parts.push(bytes)
+    }
+  }
+
+  const scalar = fmod(BigInt('0x' + bytesToHex(sha256(b4a.concat(parts)))))
+  return scalar === 0n ? 1n : scalar
+}
+
 function stateCommitment (state) {
-  if (Buffer.isBuffer(state) || state instanceof Uint8Array) {
-    return { commitment: Buffer.from(state) }
+  if (b4a.isBuffer(state) || state instanceof Uint8Array) {
+    return { commitment: b4a.from(state) }
   }
   if (!state || !state.commitment) throw new Error('expected state must include a commitment')
   return {
-    commitment: Buffer.from(state.commitment),
+    commitment: b4a.from(state.commitment),
     maxRank: state.maxRank,
     entryCount: state.entryCount,
     byteLength: state.byteLength
@@ -106,7 +144,7 @@ function stateCommitment (state) {
 }
 
 function sameBytes (a, b) {
-  return Buffer.from(a).equals(Buffer.from(b))
+  return b4a.from(a).equals(b4a.from(b))
 }
 
 function termForEntry (rank, value) {
@@ -134,6 +172,138 @@ function layerScalar (values) {
 
 function termForLayer (rank, values) {
   return ptScale(layerScalar(values), generator(rank))
+}
+
+function innerProduct (a, b) {
+  let sum = 0n
+  for (let i = 0; i < a.length; i++) {
+    sum = fmod(sum + fmod(a[i]) * fmod(b[i]))
+  }
+  return sum
+}
+
+function innerCommit (scalars, gens) {
+  let commitment = ZERO
+  for (let i = 0; i < scalars.length; i++) {
+    if (scalars[i] === 0n) continue
+    commitment = ptAdd(commitment, ptScale(scalars[i], gens[i]))
+  }
+  return commitment
+}
+
+function nextPow2 (n) {
+  let p = 1
+  while (p < n) p *= 2
+  return p
+}
+
+function vectorLength (maxRank) {
+  return nextPow2(Math.max(1, maxRank))
+}
+
+function rankGenerators (length) {
+  const gens = []
+  for (let rank = 1; rank <= length; rank++) gens.push(generator(rank))
+  return gens
+}
+
+function rankBasis (rank, length) {
+  const basis = new Array(length).fill(0n)
+  basis[rank - 1] = 1n
+  return basis
+}
+
+function vectorScalarsFromLayers (layers, maxRank) {
+  const scalars = new Array(vectorLength(maxRank)).fill(0n)
+
+  for (const [rank, layer] of layers) {
+    scalars[rank - 1] = layerScalar([...layer.values()])
+  }
+
+  return scalars
+}
+
+function ipaProveOpening (commitment, scalars, rank, valueScalar) {
+  const length = scalars.length
+  let a = scalars.slice()
+  let b = rankBasis(rank, length)
+  let G = rankGenerators(length)
+  let P = ptAdd(commitment, ptScale(valueScalar, ipaGenerator()))
+  const rounds = []
+
+  while (a.length > 1) {
+    const half = a.length >> 1
+    const aLo = a.slice(0, half)
+    const aHi = a.slice(half)
+    const bLo = b.slice(0, half)
+    const bHi = b.slice(half)
+    const GLo = G.slice(0, half)
+    const GHi = G.slice(half)
+    const U = ipaGenerator()
+
+    const L = ptAdd(innerCommit(aLo, GHi), ptScale(innerProduct(aLo, bHi), U))
+    const R = ptAdd(innerCommit(aHi, GLo), ptScale(innerProduct(aHi, bLo), U))
+    const x = challenge(P, L, R)
+    const xInv = modinv(x)
+
+    rounds.push({ L, R })
+
+    P = ptAdd(ptAdd(P, ptScale(x, L)), ptScale(xInv, R))
+    a = aLo.map((v, i) => fmod(x * v + aHi[i]))
+    b = bLo.map((v, i) => fmod(xInv * v + bHi[i]))
+    G = GLo.map((v, i) => ptAdd(ptScale(xInv, v), GHi[i]))
+  }
+
+  return {
+    length,
+    rounds,
+    finalScalar: a[0]
+  }
+}
+
+function ipaVerifyOpening (commitment, rank, valueScalar, proof) {
+  if (!proof || !Number.isSafeInteger(proof.length) || proof.length < 1) {
+    return { valid: false, reason: 'invalid IPA proof length' }
+  }
+  if (proof.length !== vectorLength(proof.maxRank)) {
+    return { valid: false, reason: 'invalid IPA proof dimension' }
+  }
+  if (rank > proof.maxRank || rank < 1) {
+    return { valid: false, reason: 'rank outside proof dimension' }
+  }
+
+  let b = rankBasis(rank, proof.length)
+  let G = rankGenerators(proof.length)
+  let P = ptAdd(commitment, ptScale(valueScalar, ipaGenerator()))
+
+  for (const round of proof.rounds) {
+    if (G.length <= 1 || G.length % 2 !== 0) {
+      return { valid: false, reason: 'invalid IPA round count' }
+    }
+
+    const half = G.length >> 1
+    const bLo = b.slice(0, half)
+    const bHi = b.slice(half)
+    const GLo = G.slice(0, half)
+    const GHi = G.slice(half)
+    const x = challenge(P, round.L, round.R)
+    const xInv = modinv(x)
+
+    P = ptAdd(ptAdd(P, ptScale(x, round.L)), ptScale(xInv, round.R))
+    b = bLo.map((v, i) => fmod(xInv * v + bHi[i]))
+    G = GLo.map((v, i) => ptAdd(ptScale(xInv, v), GHi[i]))
+  }
+
+  if (G.length !== 1) return { valid: false, reason: 'incomplete IPA proof' }
+
+  const expected = ptAdd(
+    ptScale(proof.finalScalar, G[0]),
+    ptScale(fmod(proof.finalScalar * b[0]), ipaGenerator())
+  )
+
+  if (!ptEq(P, expected)) return { valid: false, reason: 'IPA final check failed' }
+
+  return { valid: true, reason: 'OK' }
 }
 
 function commitmentForEntries (entries) {
@@ -206,7 +376,7 @@ class RankedLog {
     }
 
     if (layer.has(key)) {
-      return { rank, value: Buffer.from(layer.get(key)), added: false }
+      return { rank, value: b4a.from(layer.get(key)), added: false }
     }
 
     layer.set(key, bytes)
@@ -215,7 +385,7 @@ class RankedLog {
     this.byteLength += bytes.length
     this._commitment = commitmentForEntries(this.entries())
 
-    return { rank, value: Buffer.from(bytes), added: true }
+    return { rank, value: b4a.from(bytes), added: true }
   }
 
   has (rank, value) {
@@ -230,7 +400,7 @@ class RankedLog {
     if (!layer) return []
     return [...layer.entries()]
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([, value]) => Buffer.from(value))
+      .map(([, value]) => b4a.from(value))
   }
 
   entries () {
@@ -259,7 +429,7 @@ class RankedLog {
   }
 
   commitment () {
-    return Buffer.from(ptToBytes(this._commitment))
+    return b4a.from(ptToBytes(this._commitment))
   }
 
   state () {
@@ -278,12 +448,20 @@ class RankedLog {
     if (!this.has(rank, target)) {
       throw new Error('entry is not present in ranked log')
     }
+    if (this.layer(rank).length !== 1) {
+      throw new Error('entry proofs for non-linear layers are not implemented')
+    }
+
+    const valueScalar = hashEntry(target)
+    const scalars = vectorScalarsFromLayers(this._layers, this.maxRank)
+    const opening = ipaProveOpening(this._commitment, scalars, rank, valueScalar)
 
     return {
-      type: 'hyperdag-entry-proof-v1',
+      type: 'hyperdag-linear-entry-proof-v1',
       rank,
-      value: Buffer.from(target),
-      layers: this._proofLayers(),
+      value: b4a.from(target),
+      maxRank: this.maxRank,
+      opening,
       state: this.state()
     }
   }
@@ -305,24 +483,15 @@ class RankedLog {
     }
   }
 
-  _proofLayers () {
-    return [...this._layers.keys()]
-      .sort((a, b) => a - b)
-      .map(rank => ({
-        rank,
-        values: this.layer(rank)
-      }))
-  }
-
   static fromJSON (json) {
     const log = new RankedLog({
       entries: json.entries.map(entry => ({
         rank: entry.rank,
-        value: Buffer.from(hexToBytes(entry.value))
+        value: b4a.from(hexToBytes(entry.value))
       }))
     })
 
-    const expected = json.commitment && Buffer.from(hexToBytes(json.commitment))
+    const expected = json.commitment && b4a.from(hexToBytes(json.commitment))
     if (expected && !log.commitment().equals(expected)) {
       throw new Error('serialized commitment does not match entries')
     }
@@ -331,51 +500,34 @@ class RankedLog {
   }
 
   static fromProof (proof) {
-    if (!proof || proof.type !== 'hyperdag-entry-proof-v1') {
-      throw new Error('unsupported proof')
-    }
-
-    const log = new RankedLog()
-
-    if (!Array.isArray(proof.layers)) throw new Error('proof layers must be an array')
-
-    for (const layer of proof.layers) {
-      const rank = validateRank(layer.rank)
-      if (!Array.isArray(layer.values)) throw new Error('proof layer values must be an array')
-
-      for (const value of layer.values) {
-        log.addAtRank(rank, value)
-      }
-    }
-
-    return log
+    throw new Error('proof witnesses are not materialized by linear IPA proofs')
   }
 
   static verifyEntry (expectedState, proof) {
     try {
       const expected = stateCommitment(expectedState)
+      if (!proof || proof.type !== 'hyperdag-linear-entry-proof-v1') {
+        return { valid: false, reason: 'unsupported proof' }
+      }
+
       const rank = validateRank(proof.rank)
       const value = normalizeBytes(proof.value)
-      const log = RankedLog.fromProof(proof)
-      const actual = log.state()
+      const maxRank = proof.maxRank
 
-      if (!actual.commitment.equals(expected.commitment)) {
-        return { valid: false, reason: 'commitment mismatch' }
+      if (!Number.isSafeInteger(maxRank) || maxRank < 1) {
+        return { valid: false, reason: 'invalid proof maxRank' }
       }
-      if (expected.maxRank !== undefined && actual.maxRank !== expected.maxRank) {
+
+      if (expected.maxRank !== undefined && maxRank !== expected.maxRank) {
         return { valid: false, reason: 'maxRank mismatch' }
       }
-      if (expected.entryCount !== undefined && actual.entryCount !== expected.entryCount) {
-        return { valid: false, reason: 'entryCount mismatch' }
-      }
-      if (expected.byteLength !== undefined && actual.byteLength !== expected.byteLength) {
-        return { valid: false, reason: 'byteLength mismatch' }
-      }
-      if (!log.has(rank, value)) {
-        return { valid: false, reason: 'entry missing from proof witness' }
-      }
 
-      return { valid: true, reason: 'OK' }
+      return ipaVerifyOpening(
+        ptFromBytes(expected.commitment),
+        rank,
+        hashEntry(value),
+        { ...proof.opening, maxRank }
+      )
     } catch (err) {
       return { valid: false, reason: err.message }
     }
@@ -387,11 +539,16 @@ module.exports = {
   ZERO,
   POINT_SIZE,
   commitmentForEntries,
+  challenge,
   entryKey,
   fmod,
   generator,
   hashEntry,
   hashToScalar,
+  innerCommit,
+  innerProduct,
+  ipaProveOpening,
+  ipaVerifyOpening,
   modinv,
   normalizeBytes,
   ptAdd,
