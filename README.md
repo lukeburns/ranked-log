@@ -39,14 +39,10 @@ Branch-wise construction commits to the same state:
 
 ```js
 const left = new RankedLog()
-left.addAtRank(1, 'a')
-left.addAtRank(2, 'b')
-left.addAtRank(3, 'd')
+left.addBranch(['a', 'b', 'd'])
 
 const right = new RankedLog()
-right.addAtRank(1, 'a')
-right.addAtRank(2, 'c')
-right.addAtRank(3, 'd')
+right.addBranch(['a', 'c', 'd'])
 
 const merged = left.clone().merge(right)
 
@@ -83,23 +79,47 @@ Append multiple entries at `log.maxRank + 1`.
 Entries in a layer are deduped by byte value. The layer contribution is:
 
 ```text
-(1 / layer size) * sum h(entry.bytes) * G(rank)
+(1 / layer size) * sum h(vertex.bytes) * G(rank, rank)
 ```
 
 #### `const entry = log.addAtRank(rank, bytes)`
 
 Add an entry at an explicit rank. This is useful for importing, reconstructing, or
-building branch-wise logs.
+building custom ranked layers.
+
+#### `const entries = log.addBranch(bytesArray, [startRank])`
+
+Add a linear branch and its graph edges. This is useful when branch continuity
+matters.
+
+#### `const edge = log.addEdge(fromRank, from, toRank, to)`
+
+Add an explicit graph edge. The edge contributes to bucket `E_fromRank,toRank`
+and uses generator `G(fromRank, toRank)`.
 
 #### `log.merge(other)`
 
-Merge another ranked log or `{ entries }` object into this log.
+Merge another ranked log or `{ entries, edges }` object into this log.
 
-Entries are unioned by `(rank, bytes)`, so shared prefixes and suffixes dedupe.
+Entries are unioned by `(rank, bytes)` and edges are unioned by `(from, to)`, so
+shared prefixes and suffixes dedupe.
 
 #### `const commitment = log.commitment()`
 
-Return the compressed EC commitment as a `Buffer`.
+Return the compressed full commitment as a `Buffer`.
+
+The full commitment is the sum of `log.rankCommitment()` and
+`log.edgeCommitment()`.
+
+#### `const commitment = log.vertexCommitment()`
+
+Return the compressed diagonal vertex commitment as a `Buffer`.
+
+`log.rankCommitment()` is an alias for this diagonal commitment.
+
+#### `const commitment = log.edgeCommitment()`
+
+Return the compressed edge/continuity commitment as a `Buffer`.
 
 #### `const state = log.state()`
 
@@ -108,6 +128,9 @@ Return:
 ```js
 {
   commitment,
+  rankCommitment,
+  vertexCommitment,
+  edgeCommitment,
   maxRank,
   entryCount,
   byteLength
@@ -118,15 +141,21 @@ Return:
 
 Return the byte values at `rank`, sorted deterministically.
 
-#### `const entries = log.entries()`
+#### `const vertices = log.vertices()`
 
-Return all entries as `{ rank, value }` objects, sorted by rank and then value.
+Return all vertices as `{ rank, value }` objects, sorted by rank and then value.
+
+`log.entries()` is an alias for this vertex list.
+
+#### `const edges = log.edges()`
+
+Return graph edges as `{ fromRank, from, toRank, to }` objects.
 
 #### `const proof = log.proveEntry({ rank, value })`
 
 Create an unsigned IPA opening proof for an entry.
 
-For linear ranks, the IPA proof opens the state commitment directly. For forked
+For linear ranks, the IPA proof opens the rank commitment directly. For forked
 ranks, the proof includes the complement entries and multiplicity for that rank,
 derives the branch commitment where the claim is true, and opens that branch
 commitment.
@@ -147,19 +176,33 @@ Restore a ranked log and check that the serialized commitment matches the entrie
 
 ## Commitment
 
-For each rank, HyperDAG commits to the average scalar of the entries in that rank:
+We use a graph-specific double sum.
+
+Let `V_i` be the vertices at rank `i`, and let `E_i,j` be the edges from rank
+`i` to rank `j`.
 
 ```text
-C = sum_r layer(r) * G(r)
-layer(r) = (1 / |entries_r|) * sum h(entry.bytes)
+C = sum_i avg(V_i) * G(i, i)
+  + sum_i sum_j avg(E_i,j) * G(i, j)
 ```
 
-This preserves linear order when there is one entry per rank, while making same-rank
-forks commutative.
+where:
 
-## TODO
+```text
+avg(V_i) = (1 / |V_i|) * sum h(vertex.bytes)
+avg(E_i,j) = (1 / |E_i,j|) * sum h(from, to)
+```
 
-This ranking cannot current distinguish between these two DAGs:
+The diagonal terms `G(i, i)` are the original rank/layer commitment. Off-diagonal
+terms `G(i, j)` commit to graph continuity.
+
+The implementation exposes these slices as:
+
+```text
+commitment = rankCommitment + edgeCommitment
+```
+
+The rank commitment alone cannot distinguish these two histories:
 
 ```text
 a | b | d
@@ -172,3 +215,6 @@ and
 a | b
 a | c | d
 ```
+
+The edge commitment distinguishes them because the first has both `b -> d` and
+`c -> d`, while the second only has `c -> d`.

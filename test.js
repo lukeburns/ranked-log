@@ -2,6 +2,7 @@
 
 const {
   RankedLog,
+  commitmentForEdges,
   commitmentForEntries,
   hashEntry,
   generator,
@@ -10,7 +11,8 @@ const {
   ptScale,
   ptToBytes,
   termForEntry,
-  termForLayer
+  termForLayer,
+  termForEdgeBucket
 } = require('./index')
 const b4a = require('b4a')
 
@@ -118,7 +120,7 @@ test('a | {b,c} | d matches averaged layer construction', () => {
   expected = expected.add(termForLayer(2, [b('b'), b('c')]))
   expected = expected.add(termForEntry(3, b('d')))
 
-  assert(ptEq(log.commitmentPoint(), expected), 'commitment should use averaged rank layers')
+  assert(ptEq(log.rankCommitmentPoint(), expected), 'rank commitment should use averaged rank layers')
 })
 
 test('a | {b,c} | d is homomorphic with branch-wise construction', () => {
@@ -128,14 +130,10 @@ test('a | {b,c} | d is homomorphic with branch-wise construction', () => {
   segmentWise.append(b('d'))
 
   const branchB = new RankedLog()
-  branchB.addAtRank(1, b('a'))
-  branchB.addAtRank(2, b('b'))
-  branchB.addAtRank(3, b('d'))
+  branchB.addBranch([b('a'), b('b'), b('d')])
 
   const branchC = new RankedLog()
-  branchC.addAtRank(1, b('a'))
-  branchC.addAtRank(2, b('c'))
-  branchC.addAtRank(3, b('d'))
+  branchC.addBranch([b('a'), b('c'), b('d')])
 
   const branchWise = branchB.clone().merge(branchC)
 
@@ -149,7 +147,65 @@ test('manual commitment helper matches log state', () => {
   log.appendLayer([b('b'), b('c')])
 
   const expected = commitmentForEntries(log.entries())
-  assertBufferEqual(log.commitment(), ptToBytes(expected))
+  assertBufferEqual(log.rankCommitment(), ptToBytes(expected))
+})
+
+test('edge commitment distinguishes branch continuation', () => {
+  const terminated = new RankedLog()
+  terminated.addBranch([b('a'), b('b')])
+  terminated.addBranch([b('a'), b('c'), b('d')])
+
+  const sharedTail = new RankedLog()
+  sharedTail.addBranch([b('a'), b('b'), b('d')])
+  sharedTail.addBranch([b('a'), b('c'), b('d')])
+
+  assertBufferEqual(terminated.rankCommitment(), sharedTail.rankCommitment())
+  assertBufferNotEqual(terminated.edgeCommitment(), sharedTail.edgeCommitment())
+  assertBufferNotEqual(terminated.commitment(), sharedTail.commitment())
+})
+
+test('edge commitment matches double-sum edge buckets', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
+  log.append(b('d'))
+
+  let expected = termForEdgeBucket(1, 2, [
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('b') },
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('c') }
+  ])
+  expected = expected.add(termForEdgeBucket(2, 3, [
+    { fromRank: 2, from: b('b'), toRank: 3, to: b('d') },
+    { fromRank: 2, from: b('c'), toRank: 3, to: b('d') }
+  ]))
+
+  assertBufferEqual(log.edgeCommitment(), ptToBytes(expected))
+  assertBufferEqual(log.edgeCommitment(), ptToBytes(commitmentForEdges(log.edges())))
+})
+
+test('explicit edges can occupy non-adjacent coordinate buckets', () => {
+  const log = new RankedLog()
+  log.addEdge(1, b('a'), 3, b('d'))
+
+  const expected = termForEdgeBucket(1, 3, [
+    { fromRank: 1, from: b('a'), toRank: 3, to: b('d') }
+  ])
+
+  assertBufferEqual(log.edgeCommitment(), ptToBytes(expected))
+})
+
+test('edge bucket helper rejects edges from another coordinate', () => {
+  let threw = false
+
+  try {
+    termForEdgeBucket(1, 2, [
+      { fromRank: 2, from: b('b'), toRank: 3, to: b('d') }
+    ])
+  } catch (err) {
+    threw = true
+  }
+
+  assert(threw, 'edge bucket helper should reject mismatched edge coordinates')
 })
 
 console.log('\n── Suite 2: Layers, Deduping, and Merge ────────────────')
@@ -339,7 +395,7 @@ test('commitment-only state is enough to verify inclusion witness', () => {
   log.append(b('a'))
 
   const proof = log.proveEntry({ rank: 1, value: b('a') })
-  valid(RankedLog.verifyEntry(log.commitment(), proof))
+  valid(RankedLog.verifyEntry(log.rankCommitment(), proof))
 })
 
 console.log('\n── Suite 4: Serialization and Helpers ──────────────────')
