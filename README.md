@@ -156,3 +156,19 @@ layer(r) = (1 / |entries_r|) * sum h(entry.bytes)
 
 This preserves linear order when there is one entry per rank, while making same-rank
 forks commutative.
+
+## TODO
+
+This ranking cannot current distinguish between these two DAGs:
+
+```text
+a | b | d
+a | c | d
+```
+
+and
+
+```text
+a | b
+a | c | d
+```
