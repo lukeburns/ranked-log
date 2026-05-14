@@ -5,6 +5,7 @@ const {
   bucketDigest,
   commitmentForEdges,
   commitmentForVertices,
+  coordinateRootFromEntries,
   edgeBucketCommitment,
   elementScalarForEdge,
   elementScalarForVertex,
@@ -69,6 +70,39 @@ function b (value) {
   return b4a.from(value)
 }
 
+function expectedCoordinateRoot (log) {
+  const entries = []
+  const ranks = new Set(log.vertices().map(vertex => vertex.rank))
+
+  for (const rank of ranks) {
+    entries.push({
+      i: rank,
+      j: rank,
+      digest: bucketDigest(vertexBucketCommitment(rank, log.layer(rank)))
+    })
+  }
+
+  const coordinates = new Set(log.edges().map(edge => `${edge.fromRank},${edge.toRank}`))
+  for (const coordinate of coordinates) {
+    const [fromRank, toRank] = coordinate.split(',').map(Number)
+    entries.push({
+      i: fromRank,
+      j: toRank,
+      digest: bucketDigest(edgeBucketCommitment(fromRank, toRank, log.edgeBucket(fromRank, toRank)))
+    })
+  }
+
+  return coordinateRootFromEntries(entries)
+}
+
+function tamperCoordinateOpening (proof) {
+  if (proof.coordinateOpening.siblings.length > 0) {
+    proof.coordinateOpening.siblings[0].hash = b4a.alloc(32, 1)
+  } else {
+    proof.coordinateOpening.leafCount = 0
+  }
+}
+
 console.log('\n── Suite 1: Causal Log Basics ──────────────────────────')
 
 test('empty log has zero state', () => {
@@ -79,6 +113,7 @@ test('empty log has zero state', () => {
   assertEqual(state.vertexCount, 0)
   assertEqual(state.byteLength, 0)
   assertEqual(state.commitment.length, 32)
+  assertEqual(state.coordinateRoot.length, 32)
   assert(state.commitment.every(byte => byte === 0), 'empty commitment should be zero point')
 })
 
@@ -191,6 +226,31 @@ test('edge commitment matches set-bucket coordinate terms', () => {
 
   assertBufferEqual(log.edgeCommitment(), ptToBytes(expected))
   assertBufferEqual(log.edgeCommitment(), ptToBytes(commitmentForEdges(log.edges())))
+})
+
+test('incremental commitments match full recomputation after mixed mutations', () => {
+  const log = new CausalLog()
+
+  for (let rank = 1; rank <= 6; rank++) {
+    for (let i = 0; i < rank + 1; i++) {
+      log.addVertex(rank, b(`r${rank}:v${i}`))
+    }
+  }
+
+  for (let rank = 1; rank < 6; rank++) {
+    for (const from of log.layer(rank)) {
+      for (const to of log.layer(rank + 1)) {
+        if ((from[0] + to[0] + rank) % 3 === 0) log.addEdge(rank, from, rank + 1, to)
+      }
+    }
+  }
+
+  log.addEdge(1, b('r1:v0'), 4, b('r4:v2'))
+  log.addEdge(2, b('r2:v1'), 6, b('r6:v3'))
+
+  assertBufferEqual(log.vertexCommitment(), ptToBytes(commitmentForVertices(log.vertices())))
+  assertBufferEqual(log.edgeCommitment(), ptToBytes(commitmentForEdges(log.edges())))
+  assertBufferEqual(log.coordinateRoot(), expectedCoordinateRoot(log))
 })
 
 test('explicit edges can occupy non-adjacent coordinate buckets', () => {
@@ -401,6 +461,7 @@ test('vertex proof for a degenerate layer verifies without complements', () => {
   assertEqual(proof.type, 'hyperdag-vertex-membership-proof-v1')
   assertEqual(proof.degree, 2)
   assert(proof.bucketCommitment.length === 32, 'proof should carry bucket commitment')
+  assertEqual(proof.coordinateOpening.type, 'hyperdag-coordinate-opening-v1')
   valid(CausalLog.verifyVertex(log.state(), proof))
 })
 
@@ -497,24 +558,36 @@ test('edge proof rejects tampered bucket digest', () => {
   invalid(CausalLog.verifyEdge(log.state(), proof))
 })
 
-test('vertex proof rejects tampered outer opening', () => {
+test('vertex proof rejects tampered coordinate opening', () => {
   const log = new CausalLog()
   log.append(b('a'))
+  log.append(b('b'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
-  proof.outerOpening.finalScalar = fmod(proof.outerOpening.finalScalar + 1n)
+  tamperCoordinateOpening(proof)
 
   invalid(CausalLog.verifyVertex(log.state(), proof))
 })
 
-test('edge proof rejects tampered outer opening', () => {
+test('edge proof rejects tampered coordinate opening', () => {
+  const log = new CausalLog()
+  log.addBranch([b('a'), b('b'), b('c')])
+
+  const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
+  tamperCoordinateOpening(proof)
+
+  invalid(CausalLog.verifyEdge(log.state(), proof))
+})
+
+test('proof rejects inconsistent state coordinate root', () => {
   const log = new CausalLog()
   log.addBranch([b('a'), b('b')])
 
-  const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
-  proof.outerOpening.finalScalar = fmod(proof.outerOpening.finalScalar + 1n)
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  const state = log.state()
+  state.coordinateRoot = b4a.alloc(32, 1)
 
-  invalid(CausalLog.verifyEdge(log.state(), proof))
+  invalid(CausalLog.verifyVertex(state, proof))
 })
 
 test('proof rejects inconsistent state commitment slices', () => {
@@ -605,20 +678,20 @@ test('stale edge proof fails after expected state advances', () => {
   invalid(CausalLog.verifyEdge(log.state(), proof))
 })
 
-test('commitment-only state is enough to verify vertex membership', () => {
+test('commitment-only state is not enough to verify vertex membership', () => {
   const log = new CausalLog()
   log.append(b('a'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
-  valid(CausalLog.verifyVertex(log.commitment(), proof))
+  invalid(CausalLog.verifyVertex(log.commitment(), proof))
 })
 
-test('commitment-only state is enough to verify edge membership', () => {
+test('commitment-only state is not enough to verify edge membership', () => {
   const log = new CausalLog()
   log.addBranch([b('a'), b('b')])
 
   const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
-  valid(CausalLog.verifyEdge(log.commitment(), proof))
+  invalid(CausalLog.verifyEdge(log.commitment(), proof))
 })
 
 console.log('\n── Suite 5: Serialization and Helpers ──────────────────')
@@ -632,6 +705,7 @@ test('toJSON / fromJSON round trip preserves state', () => {
   const restored = CausalLog.fromJSON(log.toJSON())
 
   assertBufferEqual(restored.commitment(), log.commitment())
+  assertBufferEqual(restored.coordinateRoot(), log.coordinateRoot())
   assertEqual(restored.maxRank, log.maxRank)
   assertEqual(restored.vertexCount, log.vertexCount)
   assertEqual(restored.byteLength, log.byteLength)
@@ -663,6 +737,23 @@ test('fromJSON rejects mismatched commitment', () => {
   }
 
   assert(threw, 'fromJSON should reject tampered commitment')
+})
+
+test('fromJSON rejects mismatched coordinate root', () => {
+  const log = new CausalLog()
+  log.append(b('a'))
+
+  const json = log.toJSON()
+  json.coordinateRoot = b4a.alloc(32, 1).toString('hex')
+
+  let threw = false
+  try {
+    CausalLog.fromJSON(json)
+  } catch {
+    threw = true
+  }
+
+  assert(threw, 'fromJSON should reject tampered coordinate root')
 })
 
 test('point byte round trip works for commitments', () => {

@@ -90,6 +90,12 @@ Return the compressed diagonal vertex-set commitment.
 
 Return the compressed edge-set commitment.
 
+#### `const root = log.coordinateRoot()`
+
+Return the sparse authenticated coordinate-map root. Membership proofs use this
+root to open `(rank, rank)` vertex buckets or `(fromRank, toRank)` edge buckets
+without scanning the dense graph coordinate space.
+
 #### `const state = log.state()`
 
 Return:
@@ -99,6 +105,7 @@ Return:
   commitment,
   vertexCommitment,
   edgeCommitment,
+  coordinateRoot,
   maxRank,
   vertexCount,
   byteLength
@@ -127,11 +134,15 @@ Create an unsigned IPA set-membership proof for an edge.
 
 #### `const result = CausalLog.verifyVertex(state, proof)`
 
-Verify a vertex proof against an expected state or commitment.
+Verify a vertex proof against an expected state. The state must include
+`coordinateRoot`; the algebraic commitment alone is not enough for sparse
+coordinate opening verification.
 
 #### `const result = CausalLog.verifyEdge(state, proof)`
 
-Verify an edge proof against an expected state or commitment.
+Verify an edge proof against an expected state. The state must include
+`coordinateRoot`; the algebraic commitment alone is not enough for sparse
+coordinate opening verification.
 
 #### `const json = log.toJSON()`
 
@@ -164,11 +175,22 @@ Membership is verified by opening:
 P_S(h(s)) = 0
 ```
 
-Each membership proof has two IPA openings:
+The algebraic graph commitment is paired with a sparse authenticated coordinate
+map:
 
 ```text
-outer opening: H(bucketCommitment) is opened at graph coordinate G(i,j)
+R = MerkleMap((i,j) -> H(CommitSet(bucket_i,j)))
+```
+
+Each membership proof has two layers:
+
+```text
+coordinate opening: H(bucketCommitment) is opened at coordinate (i,j) under R
 inner opening: P_bucket(h(element)) = 0 is opened against bucketCommitment
 ```
 
-Merging is deterministic by unioning bucket elements and recomputing bucket polynomial commitments. This gives compact IPA membership openings, but it is not an additive accumulator for set union.
+The point commitment keeps the clean additive graph algebra, while
+`coordinateRoot` gives sparse coordinate verification. Merging is deterministic
+by unioning bucket elements and recomputing bucket polynomial commitments. This
+gives compact IPA membership openings, but it is not an additive accumulator for
+set union.

@@ -18,6 +18,9 @@ const DOMAIN_CHALLENGE = b4a.from('hyperdag:challenge:v1')
 const DOMAIN_EDGE = b4a.from('hyperdag:edge:v1')
 const DOMAIN_BUCKET_DIGEST = b4a.from('hyperdag:bucket-digest:v1')
 const DOMAIN_POLY_GENERATOR = b4a.from('hyperdag:poly-generator:v1')
+const DOMAIN_COORDINATE_EMPTY = b4a.from('hyperdag:coordinate-empty:v1')
+const DOMAIN_COORDINATE_LEAF = b4a.from('hyperdag:coordinate-leaf:v1')
+const DOMAIN_COORDINATE_NODE = b4a.from('hyperdag:coordinate-node:v1')
 
 function uint64be (n) {
   const b = b4a.allocUnsafe(8)
@@ -51,6 +54,11 @@ function hashToScalar (value, domain = DOMAIN_SCALAR) {
   const bytes = normalizeBytes(value)
   const input = b4a.concat([domain, uint64be(bytes.length), bytes])
   return fmod(BigInt('0x' + bytesToHex(sha256(input))))
+}
+
+function scalarToBytes (scalar) {
+  const hex = fmod(scalar).toString(16).padStart(64, '0')
+  return b4a.from(hexToBytes(hex))
 }
 
 const genCache = new Map()
@@ -178,6 +186,7 @@ function stateCommitment (state) {
     commitment: b4a.from(state.commitment),
     vertexCommitment: state.vertexCommitment && b4a.from(state.vertexCommitment),
     edgeCommitment: state.edgeCommitment && b4a.from(state.edgeCommitment),
+    coordinateRoot: state.coordinateRoot && b4a.from(state.coordinateRoot),
     maxRank: state.maxRank,
     vertexCount: state.vertexCount,
     byteLength: state.byteLength
@@ -250,16 +259,22 @@ function rootPolynomial (roots) {
 
   let coeffs = [1n]
   for (const root of roots) {
-    const r = fmod(root)
-    const next = new Array(coeffs.length + 1).fill(0n)
-    for (let i = 0; i < coeffs.length; i++) {
-      next[i] = fmod(next[i] - coeffs[i] * r)
-      next[i + 1] = fmod(next[i + 1] + coeffs[i])
-    }
-    coeffs = next
+    coeffs = appendRoot(coeffs, root)
   }
 
   return coeffs.map(fmod)
+}
+
+function appendRoot (coeffs, root) {
+  if (!Array.isArray(coeffs) || coeffs.length === 0) throw new Error('polynomial must contain coefficients')
+
+  const r = fmod(root)
+  const next = new Array(coeffs.length + 1).fill(0n)
+  for (let i = 0; i < coeffs.length; i++) {
+    next[i] = fmod(next[i] - coeffs[i] * r)
+    next[i + 1] = fmod(next[i + 1] + coeffs[i])
+  }
+  return next
 }
 
 function evaluationBasis (x, length) {
@@ -295,6 +310,175 @@ function polyCommitment (i, j, coeffs) {
 
 function bucketDigest (bucketCommitment) {
   return hashToScalar(ptToBytes(bucketCommitment), DOMAIN_BUCKET_DIGEST)
+}
+
+function coordinateLeafHash (i, j, digest) {
+  i = validateRank(i)
+  j = validateRank(j)
+
+  return b4a.from(sha256(b4a.concat([
+    DOMAIN_COORDINATE_LEAF,
+    uint64be(i),
+    uint64be(j),
+    scalarToBytes(digest)
+  ])))
+}
+
+function coordinateNodeHash (left, right) {
+  return b4a.from(sha256(b4a.concat([
+    DOMAIN_COORDINATE_NODE,
+    normalizeBytes(left, 'left node'),
+    normalizeBytes(right, 'right node')
+  ])))
+}
+
+function coordinateEmptyRoot () {
+  return b4a.from(sha256(DOMAIN_COORDINATE_EMPTY))
+}
+
+function compareCoordinates (a, b) {
+  if (a.i !== b.i) return a.i - b.i
+  return a.j - b.j
+}
+
+function coordinateEntriesFromMap (coordinates) {
+  return [...coordinates.values()].sort(compareCoordinates)
+}
+
+function coordinateRootFromEntries (entries) {
+  if (!entries.length) return coordinateEmptyRoot()
+
+  let level = entries
+    .slice()
+    .sort(compareCoordinates)
+    .map(entry => coordinateLeafHash(entry.i, entry.j, entry.digest))
+
+  while (level.length > 1) {
+    const next = []
+    for (let i = 0; i < level.length; i += 2) {
+      next.push(coordinateNodeHash(level[i], level[i + 1] || level[i]))
+    }
+    level = next
+  }
+
+  return level[0]
+}
+
+function coordinateRootFromMap (coordinates) {
+  return coordinateRootFromEntries(coordinateEntriesFromMap(coordinates))
+}
+
+function coordinateProofDepth (leafCount) {
+  let depth = 0
+  while (leafCount > 1) {
+    depth++
+    leafCount = Math.ceil(leafCount / 2)
+  }
+  return depth
+}
+
+function coordinateOpeningFromMap (coordinates, i, j) {
+  i = validateRank(i)
+  j = validateRank(j)
+
+  const entries = coordinateEntriesFromMap(coordinates)
+  const index = entries.findIndex(entry => entry.i === i && entry.j === j)
+  if (index === -1) throw new Error('coordinate is not present in sparse index')
+
+  let offset = index
+  let level = entries.map(entry => coordinateLeafHash(entry.i, entry.j, entry.digest))
+  const siblings = []
+
+  while (level.length > 1) {
+    const siblingIndex = offset % 2 === 0 ? offset + 1 : offset - 1
+    siblings.push({
+      side: offset % 2 === 0 ? 'right' : 'left',
+      hash: b4a.from(level[siblingIndex] || level[offset])
+    })
+
+    const next = []
+    for (let n = 0; n < level.length; n += 2) {
+      next.push(coordinateNodeHash(level[n], level[n + 1] || level[n]))
+    }
+    level = next
+    offset = Math.floor(offset / 2)
+  }
+
+  return {
+    type: 'hyperdag-coordinate-opening-v1',
+    index,
+    leafCount: entries.length,
+    siblings
+  }
+}
+
+function verifyCoordinateOpening (root, i, j, digest, proof) {
+  if (!proof || proof.type !== 'hyperdag-coordinate-opening-v1') {
+    return { valid: false, reason: 'invalid coordinate opening' }
+  }
+  if (!Number.isSafeInteger(proof.index) || proof.index < 0) {
+    return { valid: false, reason: 'invalid coordinate opening index' }
+  }
+  if (!Number.isSafeInteger(proof.leafCount) || proof.leafCount < 1 || proof.index >= proof.leafCount) {
+    return { valid: false, reason: 'invalid coordinate opening size' }
+  }
+  if (!Array.isArray(proof.siblings)) {
+    return { valid: false, reason: 'invalid coordinate opening path' }
+  }
+  if (proof.siblings.length !== coordinateProofDepth(proof.leafCount)) {
+    return { valid: false, reason: 'invalid coordinate opening depth' }
+  }
+
+  let hash = coordinateLeafHash(i, j, digest)
+  for (const sibling of proof.siblings) {
+    const siblingHash = normalizeBytes(sibling.hash, 'coordinate sibling')
+    if (siblingHash.length !== 32) return { valid: false, reason: 'invalid coordinate sibling hash' }
+
+    if (sibling.side === 'left') {
+      hash = coordinateNodeHash(siblingHash, hash)
+    } else if (sibling.side === 'right') {
+      hash = coordinateNodeHash(hash, siblingHash)
+    } else {
+      return { valid: false, reason: 'invalid coordinate sibling side' }
+    }
+  }
+
+  if (!sameBytes(hash, root)) return { valid: false, reason: 'coordinate opening root mismatch' }
+  return { valid: true, reason: 'OK' }
+}
+
+function updatePolyCommitment (i, j, commitment, oldCoeffs, newCoeffs) {
+  const length = nextPow2(Math.max(1, newCoeffs.length))
+  const deltas = new Array(length).fill(0n)
+
+  for (let k = 0; k < newCoeffs.length; k++) {
+    deltas[k] = fmod(newCoeffs[k] - (oldCoeffs[k] || 0n))
+  }
+
+  return ptAdd(commitment, innerCommit(deltas, polynomialGenerators(i, j, length)))
+}
+
+function bucketStateFromCoeffs (i, j, coeffs, commitment = polyCommitment(i, j, coeffs)) {
+  return {
+    coeffs,
+    commitment,
+    digest: bucketDigest(commitment),
+    degree: coeffs.length - 1
+  }
+}
+
+function appendBucketRoot (i, j, bucket, root) {
+  const oldCoeffs = bucket && bucket.coeffs ? bucket.coeffs : [1n]
+  const coeffs = appendRoot(oldCoeffs, root)
+  const commitment = bucket && bucket.commitment
+    ? updatePolyCommitment(i, j, bucket.commitment, oldCoeffs, coeffs)
+    : polyCommitment(i, j, coeffs)
+
+  return bucketStateFromCoeffs(i, j, coeffs, commitment)
+}
+
+function applyCoordinateDelta (commitment, i, j, oldDigest, newDigest) {
+  return ptAdd(commitment, ptScale(fmod(newDigest - oldDigest), coordinateGenerator(i, j)))
 }
 
 function vertexBucketCommitment (rank, values) {
@@ -480,19 +664,15 @@ function coordinateBasis (i, j, maxRank, length = graphVectorLength(maxRank)) {
   return basis
 }
 
-function graphScalarsFromBuckets (layers, edges, maxRank) {
+function graphScalarsFromBuckets (vertexBuckets, edgeBuckets, maxRank) {
   const scalars = new Array(graphVectorLength(maxRank)).fill(0n)
 
-  for (const [rank, layer] of layers) {
-    scalars[graphCoordinateIndex(rank, rank, maxRank)] = vertexBucketScalar(rank, [...layer.values()])
+  for (const [rank, bucket] of vertexBuckets) {
+    scalars[graphCoordinateIndex(rank, rank, maxRank)] = bucket.digest
   }
 
-  for (const bucket of edges.values()) {
-    scalars[graphCoordinateIndex(bucket.fromRank, bucket.toRank, maxRank)] = edgeBucketScalar(
-      bucket.fromRank,
-      bucket.toRank,
-      [...bucket.edges.values()]
-    )
+  for (const bucket of edgeBuckets.values()) {
+    scalars[graphCoordinateIndex(bucket.fromRank, bucket.toRank, maxRank)] = bucket.digest
   }
 
   return scalars
@@ -709,6 +889,10 @@ function commitmentForEdges (edges) {
 class CausalLog {
   constructor (opts = {}) {
     this._layers = new Map()
+    this._vertexBuckets = new Map()
+    this._coordinates = new Map()
+    this._coordinateRoot = coordinateEmptyRoot()
+    this._coordinateRootDirty = false
     this._vertexCommitment = ZERO
     this._edgeCommitment = ZERO
     this._edges = new Map()
@@ -790,7 +974,7 @@ class CausalLog {
     this.maxRank = Math.max(this.maxRank, rank)
     this.vertexCount++
     this.byteLength += bytes.length
-    this._recomputeCommitments()
+    this._updateVertexCommitment(rank, bytes)
 
     return { rank, value: b4a.from(bytes), added: true }
   }
@@ -818,7 +1002,7 @@ class CausalLog {
 
     const edge = { fromRank, from: b4a.from(from), toRank, to: b4a.from(to) }
     bucket.edges.set(key, edge)
-    this._recomputeCommitments()
+    this._updateEdgeCommitment(bucket, edge)
 
     return { ...edge, added: true }
   }
@@ -931,11 +1115,20 @@ class CausalLog {
     return b4a.from(ptToBytes(this._edgeCommitment))
   }
 
+  coordinateRoot () {
+    if (this._coordinateRootDirty) {
+      this._coordinateRoot = coordinateRootFromMap(this._coordinates)
+      this._coordinateRootDirty = false
+    }
+    return b4a.from(this._coordinateRoot)
+  }
+
   state () {
     return {
       commitment: this.commitment(),
       vertexCommitment: this.vertexCommitment(),
       edgeCommitment: this.edgeCommitment(),
+      coordinateRoot: this.coordinateRoot(),
       maxRank: this.maxRank,
       vertexCount: this.vertexCount,
       byteLength: this.byteLength
@@ -950,10 +1143,9 @@ class CausalLog {
       throw new Error('vertex is not present in causal log')
     }
 
-    const bucket = vertexBucketPolynomial(rank, this.layer(rank))
+    const bucket = this._vertexBuckets.get(rank)
     const z = elementScalarForVertex(rank, target)
-    const graphScalars = graphScalarsFromBuckets(this._layers, this._edges, this.maxRank)
-    const outerOpening = ipaProveCoordinateOpening(this.commitmentPoint(), graphScalars, rank, rank, this.maxRank, bucket.digest)
+    const coordinateOpening = coordinateOpeningFromMap(this._coordinates, rank, rank)
     const innerOpening = ipaProvePolynomialEvaluation(rank, rank, bucket.coeffs, z, 0n)
 
     return {
@@ -962,7 +1154,7 @@ class CausalLog {
       value: b4a.from(target),
       bucketCommitment: b4a.from(ptToBytes(bucket.commitment)),
       bucketDigest: bucket.digest,
-      outerOpening,
+      coordinateOpening,
       innerOpening,
       degree: bucket.degree,
       maxRank: this.maxRank,
@@ -980,10 +1172,9 @@ class CausalLog {
       throw new Error('edge is not present in causal log')
     }
 
-    const bucket = edgeBucketPolynomial(fromRank, toRank, this.edgeBucket(fromRank, toRank))
+    const bucket = this._edges.get(coordinateKey(fromRank, toRank))
     const z = elementScalarForEdge(fromRank, from, toRank, to)
-    const graphScalars = graphScalarsFromBuckets(this._layers, this._edges, this.maxRank)
-    const outerOpening = ipaProveCoordinateOpening(this.commitmentPoint(), graphScalars, fromRank, toRank, this.maxRank, bucket.digest)
+    const coordinateOpening = coordinateOpeningFromMap(this._coordinates, fromRank, toRank)
     const innerOpening = ipaProvePolynomialEvaluation(fromRank, toRank, bucket.coeffs, z, 0n)
 
     return {
@@ -992,7 +1183,7 @@ class CausalLog {
       edge: { from: b4a.from(from), to: b4a.from(to) },
       bucketCommitment: b4a.from(ptToBytes(bucket.commitment)),
       bucketDigest: bucket.digest,
-      outerOpening,
+      coordinateOpening,
       innerOpening,
       degree: bucket.degree,
       maxRank: this.maxRank,
@@ -1014,6 +1205,7 @@ class CausalLog {
       vertexCount: this.vertexCount,
       byteLength: this.byteLength,
       commitment: bytesToHex(this.commitment()),
+      coordinateRoot: bytesToHex(this.coordinateRoot()),
       vertices: this.vertices().map(vertex => ({
         rank: vertex.rank,
         value: bytesToHex(vertex.value)
@@ -1037,9 +1229,55 @@ class CausalLog {
     }
   }
 
+  _updateVertexCommitment (rank, value) {
+    const oldBucket = this._vertexBuckets.get(rank)
+    const newBucket = appendBucketRoot(rank, rank, oldBucket, elementScalarForVertex(rank, value))
+    const oldDigest = oldBucket ? oldBucket.digest : 0n
+
+    this._vertexBuckets.set(rank, newBucket)
+    this._vertexCommitment = applyCoordinateDelta(this._vertexCommitment, rank, rank, oldDigest, newBucket.digest)
+    this._updateCoordinateRoot(rank, rank, newBucket.digest)
+  }
+
+  _updateEdgeCommitment (bucket, edge) {
+    const oldDigest = bucket.digest || 0n
+    const next = appendBucketRoot(
+      bucket.fromRank,
+      bucket.toRank,
+      bucket,
+      elementScalarForEdge(edge.fromRank, edge.from, edge.toRank, edge.to)
+    )
+
+    bucket.coeffs = next.coeffs
+    bucket.commitment = next.commitment
+    bucket.digest = next.digest
+    bucket.degree = next.degree
+    this._edgeCommitment = applyCoordinateDelta(this._edgeCommitment, bucket.fromRank, bucket.toRank, oldDigest, bucket.digest)
+    this._updateCoordinateRoot(bucket.fromRank, bucket.toRank, bucket.digest)
+  }
+
+  _updateCoordinateRoot (i, j, digest) {
+    this._coordinates.set(coordinateKey(i, j), { i, j, digest })
+    this._coordinateRootDirty = true
+  }
+
   _recomputeCommitments () {
     this._vertexCommitment = commitmentForVertices(this.vertices())
     this._edgeCommitment = commitmentForEdges(this.edges())
+    this._coordinates = new Map()
+
+    for (const [rank, bucket] of this._vertexBuckets) {
+      this._coordinates.set(coordinateKey(rank, rank), { i: rank, j: rank, digest: bucket.digest })
+    }
+    for (const bucket of this._edges.values()) {
+      this._coordinates.set(coordinateKey(bucket.fromRank, bucket.toRank), {
+        i: bucket.fromRank,
+        j: bucket.toRank,
+        digest: bucket.digest
+      })
+    }
+    this._coordinateRoot = coordinateRootFromMap(this._coordinates)
+    this._coordinateRootDirty = false
   }
 
   static fromJSON (json) {
@@ -1061,11 +1299,16 @@ class CausalLog {
       throw new Error('serialized commitment does not match vertices and edges')
     }
 
+    const expectedCoordinateRoot = json.coordinateRoot && b4a.from(hexToBytes(json.coordinateRoot))
+    if (expectedCoordinateRoot && !log.coordinateRoot().equals(expectedCoordinateRoot)) {
+      throw new Error('serialized coordinate root does not match vertices and edges')
+    }
+
     return log
   }
 
   static fromProof (proof) {
-    throw new Error('proof witnesses are not materialized by linear IPA proofs')
+    throw new Error('proof witnesses are not materialized by sparse membership proofs')
   }
 
   static verifyVertex (expectedState, proof) {
@@ -1100,15 +1343,18 @@ class CausalLog {
         return { valid: false, reason: 'invalid bucket proof dimension' }
       }
 
-      const outer = ipaVerifyCoordinateOpening(
-        ptFromBytes(expected.commitment),
+      if (!expected.coordinateRoot) {
+        return { valid: false, reason: 'expected state must include coordinateRoot' }
+      }
+
+      const coordinate = verifyCoordinateOpening(
+        expected.coordinateRoot,
         rank,
         rank,
-        maxRank,
         digest,
-        proof.outerOpening
+        proof.coordinateOpening
       )
-      if (!outer.valid) return outer
+      if (!coordinate.valid) return coordinate
 
       const inner = ipaVerifyPolynomialEvaluation(
         rank,
@@ -1165,15 +1411,18 @@ class CausalLog {
         return { valid: false, reason: 'invalid bucket proof dimension' }
       }
 
-      const outer = ipaVerifyCoordinateOpening(
-        ptFromBytes(expected.commitment),
+      if (!expected.coordinateRoot) {
+        return { valid: false, reason: 'expected state must include coordinateRoot' }
+      }
+
+      const coordinateOpening = verifyCoordinateOpening(
+        expected.coordinateRoot,
         fromRank,
         toRank,
-        maxRank,
         digest,
-        proof.outerOpening
+        proof.coordinateOpening
       )
-      if (!outer.valid) return outer
+      if (!coordinateOpening.valid) return coordinateOpening
 
       const inner = ipaVerifyPolynomialEvaluation(
         fromRank,
@@ -1200,8 +1449,14 @@ module.exports = {
     commitmentForVertices,
     commitmentForEdges,
     challenge,
+    coordinateEmptyRoot,
+    coordinateLeafHash,
+    coordinateNodeHash,
+    coordinateOpeningFromMap,
     coordinateGenerator,
     coordinateBasis,
+    coordinateRootFromMap,
+    coordinateRootFromEntries,
     elementScalarForVertex,
     elementScalarForEdge,
     valueKey,
@@ -1236,12 +1491,14 @@ module.exports = {
     ptScale,
     ptToBytes,
     rootPolynomial,
+    scalarToBytes,
     sameBytes,
     bucketDigest,
     termForVertexBucket,
     termForEdgeBucket,
     vertexBucketScalar,
     vertexBucketCommitment,
-    vertexBucketPolynomial
+    vertexBucketPolynomial,
+    verifyCoordinateOpening
   }
 }
