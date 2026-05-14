@@ -1,5 +1,7 @@
 # Ranked Log
 
+An append-only, multiply-branched log.
+
 ## Example
 
 ```js
