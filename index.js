@@ -1,400 +1,406 @@
 'use strict'
 
-/**
- * ipa-tree.js
- *
- * Drop-in replacement for Hypercore's MerkleTree backend.
- * Uses an IPA (Inner Product Argument) polynomial commitment
- * instead of a Merkle tree, enabling natural support for
- * partial orders / branching histories.
- *
- * Linear-case API is fully compatible with Hypercore's
- * MerkleTree interface (append, proof, verify, hash, signable).
- *
- * Partial-order extensions:
- *   - appendConcurrent(bufs)  — append multiple blocks at same rank
- *   - mergeFrom(otherTree)    — merge another tree's commitment additively
- *   - rank(index)             — rank of block at index
- *
- * Commitment: C = Σ H(blockᵢ) · G(rankᵢ)   (EC points, bn-like curve)
- * Proof:      IPA transcript, O(log n) rounds, O(log n) bytes
- * Verify:     O(log n) EC multiplications
- */
-
 const { sha256 } = require('@noble/hashes/sha2.js')
 const { bytesToHex, hexToBytes } = require('@noble/hashes/utils.js')
 const { bn254 } = require('@noble/curves/bn254.js')
 
 const Fr = bn254.fields.Fr
 const G1Point = bn254.G1.Point
-
-// ── Field arithmetic ─────────────────────────────────────
-const ORDER = Fr.ORDER
-
-function fmod (a) { return Fr.create(a) }
-function modinv (a) { return Fr.inv(fmod(a)) }
-
-// ── Hash content to scalar ────────────────────────────────
-function hashToScalar (content) {
-  const bytes = Buffer.isBuffer(content)
-    ? content
-    : typeof content === 'string'
-      ? new TextEncoder().encode(content)
-      : content
-  const h = sha256(bytes)
-  return fmod(BigInt('0x' + bytesToHex(h)))
-}
-
-// ── Deterministic generators G(i) ────────────────────────
-const _genCache = new Map()
-function generator (i) {
-  if (_genCache.has(i)) return _genCache.get(i)
-  const s = hashToScalar('gen:' + i)
-  const pt = G1Point.BASE.multiply(s)
-  _genCache.set(i, pt)
-  return pt
-}
-
-// ── EC point helpers ──────────────────────────────────────
 const ZERO = G1Point.ZERO
+const POINT_SIZE = 33
 
-function ptAdd (P, Q) { return P.add(Q) }
-function ptScale (s, P) { return P.multiply(fmod(s)) }
-function ptEq (P, Q) { return P.equals(Q) }
+const DOMAIN_ENTRY = Buffer.from('hyperdag:entry:v1')
+const DOMAIN_GENERATOR = Buffer.from('hyperdag:rank-generator:v1')
+const DOMAIN_SCALAR = Buffer.from('hyperdag:scalar:v1')
+
+function uint64be (n) {
+  const b = Buffer.allocUnsafe(8)
+  b.writeBigUInt64BE(BigInt(n))
+  return b
+}
+
+function normalizeBytes (value, name = 'value') {
+  if (Buffer.isBuffer(value)) return Buffer.from(value)
+  if (value instanceof Uint8Array) return Buffer.from(value)
+  if (typeof value === 'string') return Buffer.from(value)
+  throw new TypeError(`${name} must be a Buffer, Uint8Array, or string`)
+}
+
+function validateRank (rank) {
+  if (!Number.isSafeInteger(rank) || rank <= 0) {
+    throw new RangeError('rank must be a positive safe integer')
+  }
+  return rank
+}
+
+function fmod (a) {
+  return Fr.create(a)
+}
+
+function modinv (a) {
+  return Fr.inv(fmod(a))
+}
+
+function hashToScalar (value, domain = DOMAIN_SCALAR) {
+  const bytes = normalizeBytes(value)
+  const input = Buffer.concat([domain, uint64be(bytes.length), bytes])
+  return fmod(BigInt('0x' + bytesToHex(sha256(input))))
+}
+
+function hashEntry (value) {
+  return hashToScalar(value, DOMAIN_ENTRY)
+}
+
+const genCache = new Map()
+
+function generator (rank) {
+  validateRank(rank)
+  const cached = genCache.get(rank)
+  if (cached) return cached
+
+  const seed = hashToScalar(uint64be(rank), DOMAIN_GENERATOR)
+  const point = G1Point.BASE.multiply(seed)
+  genCache.set(rank, point)
+  return point
+}
+
+function ptAdd (P, Q) {
+  return P.add(Q)
+}
+
+function ptScale (s, P) {
+  return P.multiply(fmod(s))
+}
+
+function ptEq (P, Q) {
+  return P.equals(Q)
+}
+
 function ptToBytes (P) {
-  if (P.is0()) return new Uint8Array(33)
+  if (P.equals(ZERO)) return new Uint8Array(POINT_SIZE)
   return P.toBytes()
 }
-function ptFromBytes (b) {
-  if (b.every(x => x === 0)) return ZERO
-  const hex = bytesToHex(b instanceof Uint8Array ? b : Buffer.from(b))
-  return G1Point.fromHex(hex)
+
+function ptFromBytes (bytes) {
+  const b = normalizeBytes(bytes, 'point')
+  if (b.length !== POINT_SIZE) throw new Error(`point must be ${POINT_SIZE} bytes`)
+  if (b.every(byte => byte === 0)) return ZERO
+  return G1Point.fromHex(bytesToHex(b))
 }
 
-// ── Fiat-Shamir challenge ─────────────────────────────────
-function challenge (...args) {
-  const parts = args.map(a => {
-    if (a instanceof Uint8Array || Buffer.isBuffer(a)) return bytesToHex(a)
-    if (typeof a === 'bigint') return a.toString(16)
-    try {
-      const b = ptToBytes(a)
-      return bytesToHex(b)
-    } catch { return String(a) }
-  })
-  const h = sha256(new TextEncoder().encode(parts.join('|')))
-  return fmod(BigInt('0x' + bytesToHex(h)))
+function entryKey (bytes) {
+  return bytesToHex(bytes)
 }
 
-// ── Pad to power of 2 ────────────────────────────────────
-function padPow2 (scalars, gens) {
-  let n = 1; while (n < scalars.length) n *= 2
-  const s = [...scalars]; while (s.length < n) s.push(0n)
-  const g = [...gens]; while (g.length < n) g.push(generator(100000 + g.length))
-  return { scalars: s, gens: g }
+function stateCommitment (state) {
+  if (Buffer.isBuffer(state) || state instanceof Uint8Array) {
+    return { commitment: Buffer.from(state) }
+  }
+  if (!state || !state.commitment) throw new Error('expected state must include a commitment')
+  return {
+    commitment: Buffer.from(state.commitment),
+    maxRank: state.maxRank,
+    entryCount: state.entryCount,
+    byteLength: state.byteLength
+  }
 }
 
-// ── Inner product commitment: Σ sᵢ · Gᵢ ─────────────────
-function innerCommit (scalars, gens) {
-  let C = ZERO
-  for (let i = 0; i < scalars.length; i++) {
-    if (scalars[i] === 0n) continue
-    C = ptAdd(C, ptScale(scalars[i], gens[i]))
-  }
-  return C
+function sameBytes (a, b) {
+  return Buffer.from(a).equals(Buffer.from(b))
 }
 
-// ── IPA Prove ────────────────────────────────────────────
-function ipaProve (scalars, gens) {
-  const rounds = []
-  let a = [...scalars]
-  let G = [...gens]
-
-  while (a.length > 1) {
-    const m = a.length >> 1
-    const aLo = a.slice(0, m); const aHi = a.slice(m)
-    const GLo = G.slice(0, m); const GHi = G.slice(m)
-
-    const L = innerCommit(aLo, GHi)
-    const R = innerCommit(aHi, GLo)
-    const Ccur = innerCommit(a, G)
-
-    const x = challenge(ptToBytes(Ccur), ptToBytes(L), ptToBytes(R))
-    const xInv = modinv(x)
-
-    rounds.push({ L, R, x })
-
-    a = aLo.map((v, i) => fmod(x * v + aHi[i]))
-    G = GLo.map((v, i) => ptAdd(ptScale(xInv, v), GHi[i]))
-  }
-
-  return { rounds, finalScalar: a[0], finalGen: G[0] }
+function termForEntry (rank, value) {
+  return ptScale(hashEntry(value), generator(rank))
 }
 
-// ── IPA Verify ────────────────────────────────────────────
-function ipaVerify (C, proof) {
-  let Ccur = C
-  for (const { L, R, x } of proof.rounds) {
-    const xCheck = challenge(ptToBytes(Ccur), ptToBytes(L), ptToBytes(R))
-    if (xCheck !== x) return { valid: false, reason: 'Fiat-Shamir mismatch' }
-    const xInv = modinv(x)
-    Ccur = ptAdd(ptAdd(Ccur, ptScale(x, L)), ptScale(xInv, R))
+function layerScalar (values) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error('layer must contain at least one entry')
   }
-  const expected = ptScale(proof.finalScalar, proof.finalGen)
-  if (!ptEq(Ccur, expected)) return { valid: false, reason: 'Final check failed' }
-  return { valid: true, reason: 'OK' }
+
+  const unique = new Map()
+  for (const value of values) {
+    const bytes = normalizeBytes(value)
+    unique.set(entryKey(bytes), bytes)
+  }
+
+  let sum = 0n
+  for (const value of unique.values()) {
+    sum = fmod(sum + hashEntry(value))
+  }
+
+  return fmod(sum * modinv(BigInt(unique.size)))
 }
 
-// ─────────────────────────────────────────────────────────
-// IPATreeBatch — equivalent to MerkleTreeBatch in hypercore
-// ─────────────────────────────────────────────────────────
+function termForLayer (rank, values) {
+  return ptScale(layerScalar(values), generator(rank))
+}
 
-class IPATreeBatch {
-  constructor (session) {
-    this.session = session
-    this.length = session.length          // number of blocks
-    this.fork = session.fork
-    this.byteLength = session.byteLength
-    this.signature = session.signature
+function commitmentForEntries (entries) {
+  const layers = new Map()
 
-    // IPA state
-    this._commitment = session._commitment  // EC point
-    this._blocks = [...session._blocks]     // [{ data, rank }]
-    this._ranks = [...session._ranks]       // rank per block index
+  for (const entry of entries) {
+    const rank = validateRank(entry.rank)
+    const bytes = normalizeBytes(entry.value)
+    const key = entryKey(bytes)
+    let layer = layers.get(rank)
 
-    this.committed = false
-    this.upgraded = false
-    this.nodes = []  // compatibility shim (hypercore internals use this)
-  }
-
-  // ── Hypercore-compatible interface ───────────────────────
-
-  // hash() returns a 32-byte buffer commitment to current state
-  hash () {
-    const pt = this._commitment
-    if (pt.equals(ZERO)) return Buffer.alloc(32)
-    return Buffer.from(ptToBytes(pt))
-  }
-
-  // signable(manifestHash) — what gets signed by ed25519
-  signable (manifestHash) {
-    const h = this.hash()
-    const len = Buffer.allocUnsafe(8)
-    len.writeBigUInt64BE(BigInt(this.length))
-    const forkBuf = Buffer.allocUnsafe(8)
-    forkBuf.writeBigUInt64BE(BigInt(this.fork))
-    return Buffer.concat([
-      manifestHash || Buffer.alloc(32),
-      h,
-      len,
-      forkBuf
-    ])
-  }
-
-  signableCompat (noHeader) {
-    return this.signable(null)
-  }
-
-  // append(buf) — add a block at the next sequential rank
-  append (buf) {
-    const rank = this.length  // linear case: rank = sequence index
-    const scalar = hashToScalar(buf)
-    const G = generator(rank)
-    const term = ptScale(scalar, G)
-
-    this._commitment = ptAdd(this._commitment, term)
-    this._blocks.push({ data: Buffer.from(buf), rank })
-    this._ranks.push(rank)
-    this.length++
-    this.byteLength += buf.length
-    this.upgraded = true
-  }
-
-  // appendConcurrent(bufs) — add multiple blocks at the same rank (fork/partial order)
-  appendConcurrent (bufs) {
-    const rank = this.length  // all get same rank
-    for (const buf of bufs) {
-      const scalar = hashToScalar(buf)
-      const G = generator(rank)
-      const term = ptScale(scalar, G)
-      this._commitment = ptAdd(this._commitment, term)
-      this._blocks.push({ data: Buffer.from(buf), rank })
-      this._ranks.push(rank)
+    if (!layer) {
+      layer = new Map()
+      layers.set(rank, layer)
     }
-    this.length += bufs.length
-    this.byteLength += bufs.reduce((s, b) => s + b.length, 0)
-    this.upgraded = true
+
+    layer.set(key, bytes)
   }
 
-  // proof({ block: { index } }) — generate IPA inclusion proof
-  proof ({ block }) {
-    if (!block) throw new Error('Only block proofs supported')
-    const { index } = block
+  let commitment = ZERO
 
-    if (index >= this._blocks.length) throw new Error('Block index out of range')
+  for (const rank of [...layers.keys()].sort((a, b) => a - b)) {
+    commitment = ptAdd(commitment, termForLayer(rank, [...layers.get(rank).values()]))
+  }
 
-    const scalars = this._blocks.map(b => hashToScalar(b.data))
-    const gens = this._blocks.map(b => generator(b.rank))
-    const { scalars: padded, gens: paddedG } = padPow2(scalars, gens)
+  return commitment
+}
 
-    const ipaProof = ipaProve(padded, paddedG)
+class RankedLog {
+  constructor (opts = {}) {
+    this._layers = new Map()
+    this._commitment = ZERO
+    this.maxRank = 0
+    this.entryCount = 0
+    this.byteLength = 0
 
-    return {
-      fork: this.fork,
-      block: {
-        index,
-        value: this._blocks[index].data,
-        rank: this._blocks[index].rank
-      },
-      ipaProof,
-      commitment: ptToBytes(this._commitment),
-      length: this.length
+    if (opts.entries) {
+      for (const entry of opts.entries) {
+        this.addAtRank(entry.rank, entry.value)
+      }
     }
   }
 
-  // verify a proof against this batch's commitment
-  verify (proof) {
-    if (!proof || !proof.ipaProof) return false
-    const C = ptFromBytes(proof.commitment)
-    const result = ipaVerify(C, proof.ipaProof)
-    return result.valid
+  append (value) {
+    return this.addAtRank(this.maxRank + 1, value)
+  }
+
+  appendLayer (values) {
+    if (!Array.isArray(values)) throw new TypeError('values must be an array')
+    const rank = this.maxRank + 1
+    const added = []
+
+    for (const value of values) {
+      const entry = this.addAtRank(rank, value)
+      if (entry.added) added.push(entry)
+    }
+
+    return { rank, added }
+  }
+
+  addAtRank (rank, value) {
+    rank = validateRank(rank)
+    const bytes = normalizeBytes(value)
+    const key = entryKey(bytes)
+    let layer = this._layers.get(rank)
+
+    if (!layer) {
+      layer = new Map()
+      this._layers.set(rank, layer)
+    }
+
+    if (layer.has(key)) {
+      return { rank, value: Buffer.from(layer.get(key)), added: false }
+    }
+
+    layer.set(key, bytes)
+    this.maxRank = Math.max(this.maxRank, rank)
+    this.entryCount++
+    this.byteLength += bytes.length
+    this._commitment = commitmentForEntries(this.entries())
+
+    return { rank, value: Buffer.from(bytes), added: true }
+  }
+
+  has (rank, value) {
+    rank = validateRank(rank)
+    const layer = this._layers.get(rank)
+    return !!layer && layer.has(entryKey(normalizeBytes(value)))
+  }
+
+  layer (rank) {
+    rank = validateRank(rank)
+    const layer = this._layers.get(rank)
+    if (!layer) return []
+    return [...layer.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([, value]) => Buffer.from(value))
+  }
+
+  entries () {
+    return [...this._layers.keys()]
+      .sort((a, b) => a - b)
+      .flatMap(rank => this.layer(rank).map(value => ({ rank, value })))
+  }
+
+  merge (other) {
+    const entries = other instanceof RankedLog ? other.entries() : other.entries
+    if (!Array.isArray(entries)) throw new TypeError('merge target must expose entries')
+
+    for (const entry of entries) {
+      this.addAtRank(entry.rank, entry.value)
+    }
+
+    return this
   }
 
   clone () {
-    const b = new IPATreeBatch(this.session)
-    b.length = this.length
-    b.fork = this.fork
-    b.byteLength = this.byteLength
-    b.signature = this.signature
-    b._commitment = this._commitment
-    b._blocks = [...this._blocks]
-    b._ranks = [...this._ranks]
-    b.upgraded = this.upgraded
-    return b
-  }
-}
-
-// ─────────────────────────────────────────────────────────
-// IPATree — equivalent to MerkleTree in hypercore
-// This is the session-level tree (persisted state)
-// ─────────────────────────────────────────────────────────
-
-class IPATree {
-  constructor (storage, opts = {}) {
-    this.storage = storage
-    this.fork = opts.fork || 0
-    this.length = 0
-    this.byteLength = 0
-    this.signature = null
-    this.prologue = opts.prologue || null
-
-    // IPA state
-    this._commitment = ZERO
-    this._blocks = []   // [{ data: Buffer, rank: Number }]
-    this._ranks = []    // rank per block index
+    return new RankedLog({ entries: this.entries() })
   }
 
-  // Create a batch for staging changes
-  batch () {
-    return new IPATreeBatch(this)
+  commitmentPoint () {
+    return this._commitment
   }
 
-  // Commit a batch to this tree
-  commit (batch) {
-    this._commitment = batch._commitment
-    this._blocks = batch._blocks
-    this._ranks = batch._ranks
-    this.length = batch.length
-    this.byteLength = batch.byteLength
-    this.fork = batch.fork
-    this.signature = batch.signature
-  }
-
-  // Direct append (non-batched)
-  append (buf) {
-    const b = this.batch()
-    b.append(buf)
-    this.commit(b)
-    return b
-  }
-
-  // Partial order: append concurrent blocks
-  appendConcurrent (bufs) {
-    const b = this.batch()
-    b.appendConcurrent(bufs)
-    this.commit(b)
-    return b
-  }
-
-  // Generate inclusion proof for block at index
-  proof (opts) {
-    const b = this.batch()
-    return b.proof(opts)
-  }
-
-  // Verify a proof
-  verify (proof) {
-    if (!proof || !proof.ipaProof) return false
-    const C = ptFromBytes(proof.commitment)
-    return ipaVerify(C, proof.ipaProof).valid
-  }
-
-  // hash() — 32-byte commitment representation
-  hash () {
-    if (this._commitment.equals(ZERO)) return Buffer.alloc(32)
+  commitment () {
     return Buffer.from(ptToBytes(this._commitment))
   }
 
-  // signable — what gets signed
-  signable (manifestHash) {
-    const b = this.batch()
-    return b.signable(manifestHash)
-  }
-
-  // Merge another tree additively (partial order extension)
-  mergeFrom (otherTree) {
-    // C(A ∪ B) = C(A) + C(B) when ranks are stable
-    this._commitment = ptAdd(this._commitment, otherTree._commitment)
-    // Merge blocks, re-sort by rank
-    for (const block of otherTree._blocks) {
-      this._blocks.push(block)
-      this._ranks.push(block.rank)
+  state () {
+    return {
+      commitment: this.commitment(),
+      maxRank: this.maxRank,
+      entryCount: this.entryCount,
+      byteLength: this.byteLength
     }
-    this.length += otherTree.length
-    this.byteLength += otherTree.byteLength
   }
 
-  // Get rank of block at index
-  rank (index) {
-    return this._ranks[index]
+  proveEntry ({ rank, value, bytes }) {
+    const target = normalizeBytes(value === undefined ? bytes : value)
+    rank = validateRank(rank)
+
+    if (!this.has(rank, target)) {
+      throw new Error('entry is not present in ranked log')
+    }
+
+    return {
+      type: 'hyperdag-entry-proof-v1',
+      rank,
+      value: Buffer.from(target),
+      layers: this._proofLayers(),
+      state: this.state()
+    }
   }
 
-  // Serialize for storage
+  verifyEntry (proof) {
+    return RankedLog.verifyEntry(this.state(), proof)
+  }
+
   toJSON () {
     return {
-      fork: this.fork,
-      length: this.length,
+      maxRank: this.maxRank,
+      entryCount: this.entryCount,
       byteLength: this.byteLength,
-      commitment: bytesToHex(ptToBytes(this._commitment)),
-      blocks: this._blocks.map(b => ({
-        data: bytesToHex(b.data),
-        rank: b.rank
+      commitment: bytesToHex(this.commitment()),
+      entries: this.entries().map(entry => ({
+        rank: entry.rank,
+        value: bytesToHex(entry.value)
       }))
     }
   }
 
-  static fromJSON (json, storage) {
-    const tree = new IPATree(storage)
-    tree.fork = json.fork
-    tree.length = json.length
-    tree.byteLength = json.byteLength
-    tree._commitment = ptFromBytes(hexToBytes(json.commitment))
-    tree._blocks = json.blocks.map(b => ({
-      data: Buffer.from(hexToBytes(b.data)),
-      rank: b.rank
-    }))
-    tree._ranks = tree._blocks.map(b => b.rank)
-    return tree
+  _proofLayers () {
+    return [...this._layers.keys()]
+      .sort((a, b) => a - b)
+      .map(rank => ({
+        rank,
+        values: this.layer(rank)
+      }))
+  }
+
+  static fromJSON (json) {
+    const log = new RankedLog({
+      entries: json.entries.map(entry => ({
+        rank: entry.rank,
+        value: Buffer.from(hexToBytes(entry.value))
+      }))
+    })
+
+    const expected = json.commitment && Buffer.from(hexToBytes(json.commitment))
+    if (expected && !log.commitment().equals(expected)) {
+      throw new Error('serialized commitment does not match entries')
+    }
+
+    return log
+  }
+
+  static fromProof (proof) {
+    if (!proof || proof.type !== 'hyperdag-entry-proof-v1') {
+      throw new Error('unsupported proof')
+    }
+
+    const log = new RankedLog()
+
+    if (!Array.isArray(proof.layers)) throw new Error('proof layers must be an array')
+
+    for (const layer of proof.layers) {
+      const rank = validateRank(layer.rank)
+      if (!Array.isArray(layer.values)) throw new Error('proof layer values must be an array')
+
+      for (const value of layer.values) {
+        log.addAtRank(rank, value)
+      }
+    }
+
+    return log
+  }
+
+  static verifyEntry (expectedState, proof) {
+    try {
+      const expected = stateCommitment(expectedState)
+      const rank = validateRank(proof.rank)
+      const value = normalizeBytes(proof.value)
+      const log = RankedLog.fromProof(proof)
+      const actual = log.state()
+
+      if (!actual.commitment.equals(expected.commitment)) {
+        return { valid: false, reason: 'commitment mismatch' }
+      }
+      if (expected.maxRank !== undefined && actual.maxRank !== expected.maxRank) {
+        return { valid: false, reason: 'maxRank mismatch' }
+      }
+      if (expected.entryCount !== undefined && actual.entryCount !== expected.entryCount) {
+        return { valid: false, reason: 'entryCount mismatch' }
+      }
+      if (expected.byteLength !== undefined && actual.byteLength !== expected.byteLength) {
+        return { valid: false, reason: 'byteLength mismatch' }
+      }
+      if (!log.has(rank, value)) {
+        return { valid: false, reason: 'entry missing from proof witness' }
+      }
+
+      return { valid: true, reason: 'OK' }
+    } catch (err) {
+      return { valid: false, reason: err.message }
+    }
   }
 }
 
-module.exports = { IPATree, IPATreeBatch, ipaProve, ipaVerify, innerCommit, generator, hashToScalar, padPow2, ZERO, ptAdd, ptScale, ptEq, ptToBytes, ptFromBytes, fmod, modinv, challenge }
+module.exports = {
+  RankedLog,
+  ZERO,
+  POINT_SIZE,
+  commitmentForEntries,
+  entryKey,
+  fmod,
+  generator,
+  hashEntry,
+  hashToScalar,
+  modinv,
+  normalizeBytes,
+  ptAdd,
+  ptEq,
+  ptFromBytes,
+  ptScale,
+  ptToBytes,
+  sameBytes,
+  layerScalar,
+  termForEntry,
+  termForLayer
+}

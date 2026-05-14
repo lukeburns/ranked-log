@@ -1,15 +1,16 @@
 'use strict'
 
-/**
- * test.js
- * Tests covering all Hypercore-compatible and partial-order functionality
- */
-
 const {
-  IPATree, IPATreeBatch,
-  ipaProve, ipaVerify,
-  innerCommit, generator, hashToScalar,
-  padPow2, ZERO, ptAdd, ptScale, ptEq
+  RankedLog,
+  commitmentForEntries,
+  hashEntry,
+  generator,
+  ptEq,
+  ptFromBytes,
+  ptScale,
+  ptToBytes,
+  termForEntry,
+  termForLayer
 } = require('./index')
 
 let passed = 0
@@ -20,305 +21,347 @@ function test (label, fn) {
     fn()
     console.log(`  ✓ ${label}`)
     passed++
-  } catch (e) {
+  } catch (err) {
     console.log(`  ✗ ${label}`)
-    console.log(`    ${e.message}`)
+    console.log(`    ${err.message}`)
     failed++
   }
 }
 
-function assert (cond, msg) {
-  if (!cond) throw new Error(msg || 'assertion failed')
+function assert (condition, message) {
+  if (!condition) throw new Error(message || 'assertion failed')
 }
 
-function assertEqual (a, b, msg) {
-  if (a !== b) throw new Error(msg || `expected ${a} === ${b}`)
+function assertEqual (actual, expected, message) {
+  if (actual !== expected) throw new Error(message || `expected ${actual} === ${expected}`)
 }
 
-// ── Suite 1: Core IPA ────────────────────────────────────
-console.log('\n── Suite 1: Core IPA ───────────────────────────────────')
+function assertBufferEqual (actual, expected, message) {
+  assert(Buffer.from(actual).equals(Buffer.from(expected)), message || 'buffers differ')
+}
 
-test('IPA prove and verify round-trip (n=4)', () => {
-  const scalars = [3n, 7n, 2n, 9n]
-  const gens = scalars.map((_, i) => generator(i))
-  const { scalars: s, gens: g } = padPow2(scalars, gens)
-  const C = innerCommit(s, g)
-  const proof = ipaProve(s, g)
-  const { valid } = ipaVerify(C, proof)
-  assert(valid, 'IPA proof should verify')
+function assertBufferNotEqual (actual, expected, message) {
+  assert(!Buffer.from(actual).equals(Buffer.from(expected)), message || 'buffers should differ')
+}
+
+function valid (result, message) {
+  assert(result.valid, message || result.reason)
+}
+
+function invalid (result, message) {
+  assert(!result.valid, message || 'verification should fail')
+}
+
+function b (value) {
+  return Buffer.from(value)
+}
+
+console.log('\n── Suite 1: Ranked Log Basics ──────────────────────────')
+
+test('empty log has zero state', () => {
+  const log = new RankedLog()
+  const state = log.state()
+
+  assertEqual(state.maxRank, 0)
+  assertEqual(state.entryCount, 0)
+  assertEqual(state.byteLength, 0)
+  assertEqual(state.commitment.length, 33)
+  assert(state.commitment.every(byte => byte === 0), 'empty commitment should be zero point')
 })
 
-test('IPA prove and verify round-trip (n=8)', () => {
-  const scalars = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n]
-  const gens = scalars.map((_, i) => generator(i))
-  const proof = ipaProve(scalars, gens)
-  const C = innerCommit(scalars, gens)
-  const { valid } = ipaVerify(C, proof)
-  assert(valid, 'IPA proof (n=8) should verify')
+test('append assigns increasing ranks', () => {
+  const log = new RankedLog()
+  const a = log.append(b('a'))
+  const bEntry = log.append(b('b'))
+
+  assertEqual(a.rank, 1)
+  assertEqual(bEntry.rank, 2)
+  assertEqual(log.maxRank, 2)
+  assertEqual(log.entryCount, 2)
+  assertEqual(log.byteLength, 2)
 })
 
-test('IPA fails on wrong commitment', () => {
-  const scalars = [3n, 7n, 2n, 9n]
-  const gens = scalars.map((_, i) => generator(i))
-  const proof = ipaProve(scalars, gens)
-  const wrongC = generator(999)  // completely wrong point
-  const { valid } = ipaVerify(wrongC, proof)
-  assert(!valid, 'IPA should fail with wrong commitment')
+test('linear order is rank-sensitive', () => {
+  const ab = new RankedLog()
+  ab.append(b('a'))
+  ab.append(b('b'))
+
+  const ba = new RankedLog()
+  ba.append(b('b'))
+  ba.append(b('a'))
+
+  assertBufferNotEqual(ab.commitment(), ba.commitment(), 'reordering across ranks changes commitment')
 })
 
-// ── Suite 2: Linear chain (Hypercore compatible) ──────────
-console.log('\n── Suite 2: Linear chain (Hypercore compatible) ────────')
+test('same-rank layer is commutative', () => {
+  const bc = new RankedLog()
+  bc.append(b('a'))
+  bc.appendLayer([b('b'), b('c')])
+  bc.append(b('d'))
 
-test('append single block', () => {
-  const tree = new IPATree(null)
-  tree.append(Buffer.from('hello'))
-  assertEqual(tree.length, 1)
-  assertEqual(tree.byteLength, 5)
+  const cb = new RankedLog()
+  cb.append(b('a'))
+  cb.appendLayer([b('c'), b('b')])
+  cb.append(b('d'))
+
+  assertBufferEqual(bc.commitment(), cb.commitment(), '{b,c} and {c,b} should commit the same')
 })
 
-test('append multiple blocks sequentially', () => {
-  const tree = new IPATree(null)
-  const blocks = ['block0', 'block1', 'block2', 'block3'].map(Buffer.from)
-  blocks.forEach(b => tree.append(b))
-  assertEqual(tree.length, 4)
+test('a | {b,c} | d matches averaged layer construction', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
+  log.append(b('d'))
+
+  let expected = termForEntry(1, b('a'))
+  expected = expected.add(termForLayer(2, [b('b'), b('c')]))
+  expected = expected.add(termForEntry(3, b('d')))
+
+  assert(ptEq(log.commitmentPoint(), expected), 'commitment should use averaged rank layers')
 })
 
-test('hash() returns 33-byte compressed EC point', () => {
-  const tree = new IPATree(null)
-  tree.append(Buffer.from('data'))
-  const h = tree.hash()
-  assert(Buffer.isBuffer(h), 'hash should be a Buffer')
-  assertEqual(h.length, 33, 'compressed EC point is 33 bytes')
+test('a | {b,c} | d is homomorphic with branch-wise construction', () => {
+  const segmentWise = new RankedLog()
+  segmentWise.append(b('a'))
+  segmentWise.appendLayer([b('b'), b('c')])
+  segmentWise.append(b('d'))
+
+  const branchB = new RankedLog()
+  branchB.addAtRank(1, b('a'))
+  branchB.addAtRank(2, b('b'))
+  branchB.addAtRank(3, b('d'))
+
+  const branchC = new RankedLog()
+  branchC.addAtRank(1, b('a'))
+  branchC.addAtRank(2, b('c'))
+  branchC.addAtRank(3, b('d'))
+
+  const branchWise = branchB.clone().merge(branchC)
+
+  assertBufferEqual(segmentWise.commitment(), branchWise.commitment())
+  assertEqual(branchWise.entryCount, 4, 'shared prefix and suffix should dedupe')
 })
 
-test('hash() is deterministic', () => {
-  const tree1 = new IPATree(null)
-  const tree2 = new IPATree(null)
-  tree1.append(Buffer.from('block0'))
-  tree2.append(Buffer.from('block0'))
-  assert(tree1.hash().equals(tree2.hash()), 'same blocks → same hash')
+test('manual commitment helper matches log state', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
+
+  const expected = commitmentForEntries(log.entries())
+  assertBufferEqual(log.commitment(), ptToBytes(expected))
 })
 
-test('hash() changes on append', () => {
-  const tree = new IPATree(null)
-  tree.append(Buffer.from('block0'))
-  const h1 = tree.hash()
-  tree.append(Buffer.from('block1'))
-  const h2 = tree.hash()
-  assert(!h1.equals(h2), 'hash should change after append')
+console.log('\n── Suite 2: Layers, Deduping, and Merge ────────────────')
+
+test('duplicate entries at the same rank are deduped', () => {
+  const withDupes = new RankedLog()
+  withDupes.appendLayer([b('b'), b('b'), b('c')])
+
+  const deduped = new RankedLog()
+  deduped.appendLayer([b('b'), b('c')])
+
+  assertEqual(withDupes.entryCount, 2)
+  assertBufferEqual(withDupes.commitment(), deduped.commitment())
 })
 
-test('signable() returns buffer', () => {
-  const tree = new IPATree(null)
-  tree.append(Buffer.from('block0'))
-  const mh = Buffer.alloc(32, 1)
-  const s = tree.signable(mh)
-  assert(Buffer.isBuffer(s), 'signable should be a Buffer')
-  assert(s.length > 32, 'signable should be longer than manifest hash alone')
+test('same bytes at different ranks are distinct entries', () => {
+  const log = new RankedLog()
+  log.append(b('x'))
+  log.append(b('x'))
+
+  assertEqual(log.entryCount, 2)
+  assertEqual(log.layer(1).length, 1)
+  assertEqual(log.layer(2).length, 1)
 })
 
-test('ranks are sequential in linear chain', () => {
-  const tree = new IPATree(null)
-  'abcd'.split('').forEach((c, i) => {
-    tree.append(Buffer.from(c))
-    assertEqual(tree.rank(i), i, `rank of block ${i} should be ${i}`)
-  })
+test('merge is order-independent for disjoint ranked entries', () => {
+  const left = new RankedLog()
+  left.addAtRank(1, b('a'))
+  left.addAtRank(2, b('b'))
+
+  const right = new RankedLog()
+  right.addAtRank(2, b('c'))
+  right.addAtRank(3, b('d'))
+
+  const lr = left.clone().merge(right)
+  const rl = right.clone().merge(left)
+
+  assertBufferEqual(lr.commitment(), rl.commitment())
+  assertEqual(lr.entryCount, 4)
+  assertEqual(rl.entryCount, 4)
 })
 
-// ── Suite 3: Inclusion proofs ─────────────────────────────
-console.log('\n── Suite 3: Inclusion proofs ───────────────────────────')
+test('merge dedupes shared entries', () => {
+  const left = new RankedLog()
+  left.addAtRank(1, b('a'))
+  left.addAtRank(2, b('b'))
 
-test('proof() and verify() for block 0', () => {
-  const tree = new IPATree(null)
-  ;['a', 'b', 'c', 'd'].forEach(c => tree.append(Buffer.from(c)))
-  const proof = tree.proof({ block: { index: 0 } })
-  assert(tree.verify(proof), 'proof for block 0 should verify')
+  const right = new RankedLog()
+  right.addAtRank(1, b('a'))
+  right.addAtRank(2, b('c'))
+
+  const merged = left.clone().merge(right)
+
+  assertEqual(merged.entryCount, 3)
+  assertEqual(merged.layer(1).length, 1)
+  assertEqual(merged.layer(2).length, 2)
 })
 
-test('proof() and verify() for middle block', () => {
-  const tree = new IPATree(null)
-  ;['a', 'b', 'c', 'd'].forEach(c => tree.append(Buffer.from(c)))
-  const proof = tree.proof({ block: { index: 2 } })
-  assert(tree.verify(proof), 'proof for block 2 should verify')
+test('layer inspection is deterministic', () => {
+  const log = new RankedLog()
+  log.appendLayer([b('c'), b('a'), b('b')])
+
+  assertEqual(log.layer(1).map(value => value.toString()).join(','), 'a,b,c')
 })
 
-test('proof() and verify() for last block', () => {
-  const tree = new IPATree(null)
-  ;['a', 'b', 'c', 'd'].forEach(c => tree.append(Buffer.from(c)))
-  const proof = tree.proof({ block: { index: 3 } })
-  assert(tree.verify(proof), 'proof for block 3 should verify')
+console.log('\n── Suite 3: Unsigned Entry Verification ────────────────')
+
+test('valid entry proof verifies against expected state', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
+  log.append(b('d'))
+
+  const proof = log.proveEntry({ rank: 2, value: b('b') })
+  valid(RankedLog.verifyEntry(log.state(), proof))
+  valid(log.verifyEntry(proof))
 })
 
-test('proof from a different tree does not verify', () => {
-  const tree1 = new IPATree(null)
-  const tree2 = new IPATree(null)
-  ;['a', 'b', 'c', 'd'].forEach(c => tree1.append(Buffer.from(c)))
-  ;['x', 'y', 'z', 'w'].forEach(c => tree2.append(Buffer.from(c)))
-  const proof = tree1.proof({ block: { index: 0 } })
-  // Tamper: swap the commitment to tree2's commitment
-  const tamperedProof = { ...proof, commitment: tree2.hash() }
-  assert(!tree2.verify(tamperedProof), 'tampered proof should not verify')
+test('proof does not verify against a different commitment', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+
+  const other = new RankedLog()
+  other.append(b('x'))
+
+  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  invalid(RankedLog.verifyEntry(other.state(), proof))
 })
 
-// ── Suite 4: Incremental updates ─────────────────────────
-console.log('\n── Suite 4: Incremental updates ────────────────────────')
+test('proof does not trust its embedded state', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
 
-test('C(A + block) = C(A) + H(block)*G(rank)', () => {
-  const { ptAdd, ptScale, ptEq, generator, hashToScalar, ZERO } = require('./index.js')
+  const other = new RankedLog()
+  other.append(b('x'))
 
-  const tree = new IPATree(null)
-  ;['a', 'b', 'c'].forEach(c => tree.append(Buffer.from(c)))
-  const C_before = Buffer.from(tree.hash())
+  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  proof.state = other.state()
 
-  // Manually compute what the new commitment should be
-  const newBlock = Buffer.from('d')
-  const newRank = tree.length  // = 3
-  const term = ptScale(hashToScalar(newBlock), generator(newRank))
-  const { ptFromBytes } = require('./index')
-  const C_prev_pt = ptFromBytes(C_before)
-  const C_expected = ptAdd(C_prev_pt, term)
-
-  tree.append(newBlock)
-  const C_actual = ptFromBytes(tree.hash())
-
-  assert(C_actual.equals(C_expected), 'incremental append should be additive')
+  invalid(RankedLog.verifyEntry(other.state(), proof))
 })
 
-test('batch commit matches direct append', () => {
-  const tree1 = new IPATree(null)
-  const tree2 = new IPATree(null)
+test('mutated proof rank fails', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.append(b('b'))
 
-  ;['a', 'b', 'c'].forEach(c => tree1.append(Buffer.from(c)))
+  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  proof.rank = 2
 
-  const batch = tree2.batch()
-  ;['a', 'b', 'c'].forEach(c => batch.append(Buffer.from(c)))
-  tree2.commit(batch)
-
-  assert(tree1.hash().equals(tree2.hash()), 'batch and direct append should match')
+  invalid(RankedLog.verifyEntry(log.state(), proof))
 })
 
-// ── Suite 5: Partial order (fork/merge) ──────────────────
-console.log('\n── Suite 5: Partial order (fork/merge) ─────────────────')
+test('mutated proof value fails', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.append(b('b'))
 
-test('appendConcurrent: two blocks at same rank', () => {
-  const tree = new IPATree(null)
-  tree.append(Buffer.from('a'))
-  tree.appendConcurrent([Buffer.from('b1'), Buffer.from('b2')])
-  assertEqual(tree.length, 3, 'length should be 3 after concurrent append')
-  // b1 and b2 should have same rank
-  assertEqual(tree.rank(1), tree.rank(2), 'concurrent blocks should have same rank')
+  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  proof.value = b('x')
+
+  invalid(RankedLog.verifyEntry(log.state(), proof))
 })
 
-test('concurrent blocks contribute different terms at same rank', () => {
-  const { ptFromBytes } = require('./index')
-  const tree = new IPATree(null)
-  tree.append(Buffer.from('z'))
-  tree.appendConcurrent([Buffer.from('b1'), Buffer.from('b2')])
+test('mutated witness value fails', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.append(b('b'))
 
-  // Manually compute expected commitment
-  // C = H(z)*G(0) + H(b1)*G(1) + H(b2)*G(1)
-  const s0 = hashToScalar(Buffer.from('z'))
-  const s1 = hashToScalar(Buffer.from('b1'))
-  const s2 = hashToScalar(Buffer.from('b2'))
-  const expected = ptAdd(
-    ptAdd(ptScale(s0, generator(0)), ptScale(s1, generator(1))),
-    ptScale(s2, generator(1))
-  )
-  const expectedBytes = Buffer.from(expected.toBytes())
-  assert(tree.hash().equals(expectedBytes), 'fork commitment should be sum of terms')
+  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  proof.layers[0].values[0] = b('x')
+
+  invalid(RankedLog.verifyEntry(log.state(), proof))
 })
 
-test('mergeFrom: C(A∪B) = C(A) + C(B) for disjoint trees', () => {
-  const { ptFromBytes } = require('./index')
+test('stale proof fails after expected state advances', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
 
-  const treeA = new IPATree(null)
-  treeA.append(Buffer.from('a'))
-  treeA.append(Buffer.from('b'))
+  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  log.append(b('b'))
 
-  const treeB = new IPATree(null)
-  treeB.append(Buffer.from('a'))
-  treeB.append(Buffer.from('b'))
-  treeB.append(Buffer.from('c'))  // extra block
-
-  // Build combined tree directly
-  const combined = new IPATree(null)
-  ;['a', 'b', 'c'].forEach(c => combined.append(Buffer.from(c)))
-
-  // Build via merge: start with treeA, add only treeB's extra term
-  const merged = new IPATree(null)
-  ;['a', 'b'].forEach(c => merged.append(Buffer.from(c)))
-
-  // Add c term manually (incremental)
-  const { ptAdd: add, ptScale: scale, generator: gen, hashToScalar: hts } = require('./index')
-  const cTerm = scale(hts(Buffer.from('c')), gen(2))
-  merged._commitment = add(ptFromBytes(merged.hash()), cTerm)
-  merged._blocks.push({ data: Buffer.from('c'), rank: 2 })
-  merged._ranks.push(2)
-  merged.length = 3
-
-  assert(
-    combined.hash().equals(merged.hash()),
-    'incremental merge should match full construction'
-  )
+  invalid(RankedLog.verifyEntry(log.state(), proof))
 })
 
-test('proof verifies after fork', () => {
-  const tree = new IPATree(null)
-  tree.append(Buffer.from('z'))
-  tree.appendConcurrent([Buffer.from('b1'), Buffer.from('b2')])
-  tree.append(Buffer.from('c'))
+test('commitment-only state is enough to verify inclusion witness', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
 
-  const proof0 = tree.proof({ block: { index: 0 } })
-  const proof1 = tree.proof({ block: { index: 1 } })
-  const proof2 = tree.proof({ block: { index: 2 } })
-
-  assert(tree.verify(proof0), 'proof for block 0 (before fork) should verify')
-  assert(tree.verify(proof1), 'proof for fork branch b1 should verify')
-  assert(tree.verify(proof2), 'proof for fork branch b2 should verify')
+  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  valid(RankedLog.verifyEntry(log.commitment(), proof))
 })
 
-// ── Suite 6: Serialization ────────────────────────────────
-console.log('\n── Suite 6: Serialization ──────────────────────────────')
+console.log('\n── Suite 4: Serialization and Helpers ──────────────────')
 
-test('toJSON / fromJSON round-trip', () => {
-  const tree = new IPATree(null)
-  ;['block0', 'block1', 'block2'].forEach(b => tree.append(Buffer.from(b)))
+test('toJSON / fromJSON round trip preserves state', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
+  log.append(b('d'))
 
-  const json = tree.toJSON()
-  const restored = IPATree.fromJSON(json, null)
+  const restored = RankedLog.fromJSON(log.toJSON())
 
-  assert(tree.hash().equals(restored.hash()), 'restored tree should have same hash')
-  assertEqual(restored.length, tree.length, 'restored length should match')
-  assertEqual(restored.byteLength, tree.byteLength, 'restored byteLength should match')
+  assertBufferEqual(restored.commitment(), log.commitment())
+  assertEqual(restored.maxRank, log.maxRank)
+  assertEqual(restored.entryCount, log.entryCount)
+  assertEqual(restored.byteLength, log.byteLength)
 })
 
-test('toJSON / fromJSON preserves proof validity', () => {
-  const tree = new IPATree(null)
-  ;['a', 'b', 'c', 'd'].forEach(c => tree.append(Buffer.from(c)))
+test('restored log verifies original proof', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
 
-  const proof = tree.proof({ block: { index: 1 } })
-  const json = tree.toJSON()
-  const restored = IPATree.fromJSON(json, null)
+  const proof = log.proveEntry({ rank: 2, value: b('c') })
+  const restored = RankedLog.fromJSON(log.toJSON())
 
-  assert(restored.verify(proof), 'proof should still verify after serialization round-trip')
+  valid(restored.verifyEntry(proof))
 })
 
-// ── Suite 7: Proof size ───────────────────────────────────
-console.log('\n── Suite 7: Proof sizes ────────────────────────────────')
+test('fromJSON rejects mismatched commitment', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
 
-test('proof size is O(log n)', () => {
-  for (const n of [2, 4, 8, 16]) {
-    const tree = new IPATree(null)
-    for (let i = 0; i < n; i++) tree.append(Buffer.from(`block${i}`))
-    const proof = tree.proof({ block: { index: 0 } })
-    const rounds = proof.ipaProof.rounds.length
-    const expectedRounds = Math.ceil(Math.log2(n))
-    assertEqual(rounds, expectedRounds, `n=${n}: expected ${expectedRounds} rounds, got ${rounds}`)
+  const json = log.toJSON()
+  json.commitment = Buffer.from(generator(1).toBytes()).toString('hex')
+
+  let threw = false
+  try {
+    RankedLog.fromJSON(json)
+  } catch {
+    threw = true
   }
-  console.log('    (proof rounds = log₂(n) ✓)')
+
+  assert(threw, 'fromJSON should reject tampered commitment')
 })
 
-// ── Results ───────────────────────────────────────────────
+test('point byte round trip works for commitments', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+
+  const point = ptFromBytes(log.commitment())
+  assert(ptEq(point, log.commitmentPoint()))
+})
+
+test('rank generator binds rank, not append position', () => {
+  const s = hashEntry(b('x'))
+  const rank1 = ptScale(s, generator(1))
+  const rank2 = ptScale(s, generator(2))
+
+  assert(!ptEq(rank1, rank2), 'same bytes at different ranks should use different generators')
+})
+
 console.log(`\n${'─'.repeat(50)}`)
 console.log(`Results: ${passed} passed, ${failed} failed`)
 if (failed > 0) process.exit(1)
