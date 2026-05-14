@@ -16,6 +16,8 @@ const DOMAIN_INNER_PRODUCT = b4a.from('hyperdag:inner-product-generator:v1')
 const DOMAIN_SCALAR = b4a.from('hyperdag:scalar:v1')
 const DOMAIN_CHALLENGE = b4a.from('hyperdag:challenge:v1')
 const DOMAIN_EDGE = b4a.from('hyperdag:edge:v1')
+const DOMAIN_BUCKET_DIGEST = b4a.from('hyperdag:bucket-digest:v1')
+const DOMAIN_POLY_GENERATOR = b4a.from('hyperdag:poly-generator:v1')
 
 function uint64be (n) {
   const b = b4a.allocUnsafe(8)
@@ -56,6 +58,7 @@ function hashEntry (value) {
 }
 
 const genCache = new Map()
+const polyGenCache = new Map()
 let innerProductGenerator = null
 
 function coordinateKey (i, j) {
@@ -79,6 +82,29 @@ function coordinateGenerator (i, j) {
 function generator (rank) {
   validateRank(rank)
   return coordinateGenerator(rank, rank)
+}
+
+function polynomialGenerator (i, j, k) {
+  i = validateRank(i)
+  j = validateRank(j)
+  if (!Number.isSafeInteger(k) || k < 0) throw new RangeError('polynomial generator index must be a non-negative safe integer')
+
+  const key = `${i},${j},${k}`
+  const cached = polyGenCache.get(key)
+  if (cached) return cached
+
+  const seed = hashToScalar(b4a.concat([uint64be(i), uint64be(j), uint64be(k)]), DOMAIN_POLY_GENERATOR)
+  const point = Point.BASE.multiply(seed)
+  polyGenCache.set(key, point)
+  return point
+}
+
+function polynomialGenerators (i, j, length) {
+  if (!Number.isSafeInteger(length) || length < 1) throw new RangeError('generator length must be positive')
+
+  const gens = []
+  for (let k = 0; k < length; k++) gens.push(polynomialGenerator(i, j, k))
+  return gens
 }
 
 function ipaGenerator () {
@@ -164,35 +190,34 @@ function stateCommitment (state) {
   }
 }
 
+function verifyStateSlices (expected) {
+  const vertexCommitment = expected.vertexCommitment || expected.rankCommitment
+  const edgeCommitment = expected.edgeCommitment || expected.transitionCommitment
+
+  if (vertexCommitment && edgeCommitment) {
+    const combined = ptAdd(ptFromBytes(vertexCommitment), ptFromBytes(edgeCommitment))
+    if (!b4a.from(ptToBytes(combined)).equals(expected.commitment)) {
+      return { valid: false, reason: 'state commitment mismatch' }
+    }
+  }
+
+  return { valid: true, reason: 'OK' }
+}
+
+function sameScalar (a, b) {
+  return fmod(a) === fmod(b)
+}
+
 function sameBytes (a, b) {
   return b4a.from(a).equals(b4a.from(b))
 }
 
 function termForEntry (rank, value) {
-  return ptScale(hashEntry(value), generator(rank))
-}
-
-function layerScalar (values) {
-  if (!Array.isArray(values) || values.length === 0) {
-    throw new Error('layer must contain at least one entry')
-  }
-
-  const unique = new Map()
-  for (const value of values) {
-    const bytes = normalizeBytes(value)
-    unique.set(entryKey(bytes), bytes)
-  }
-
-  let sum = 0n
-  for (const value of unique.values()) {
-    sum = fmod(sum + hashEntry(value))
-  }
-
-  return fmod(sum * modinv(BigInt(unique.size)))
+  return termForLayer(rank, [value])
 }
 
 function termForLayer (rank, values) {
-  return ptScale(layerScalar(values), generator(rank))
+  return ptScale(vertexBucketScalar(rank, values), generator(rank))
 }
 
 function edgeScalar ({ fromRank, from, toRank, to }) {
@@ -215,26 +240,186 @@ function edgeScalar ({ fromRank, from, toRank, to }) {
   )
 }
 
-function edgeLayerScalar (edges) {
-  if (!Array.isArray(edges) || edges.length === 0) {
-    throw new Error('edge bucket must contain at least one edge')
+function elementScalarForVertex (rank, value) {
+  rank = validateRank(rank)
+  const bytes = normalizeBytes(value)
+
+  return hashToScalar(
+    b4a.concat([
+      uint64be(rank),
+      uint64be(bytes.length),
+      bytes
+    ]),
+    DOMAIN_ENTRY
+  )
+}
+
+function elementScalarForEdge (fromRank, from, toRank, to) {
+  return edgeScalar({ fromRank, from, toRank, to })
+}
+
+function rootPolynomial (roots) {
+  if (!Array.isArray(roots)) throw new TypeError('roots must be an array')
+
+  let coeffs = [1n]
+  for (const root of roots) {
+    const r = fmod(root)
+    const next = new Array(coeffs.length + 1).fill(0n)
+    for (let i = 0; i < coeffs.length; i++) {
+      next[i] = fmod(next[i] - coeffs[i] * r)
+      next[i + 1] = fmod(next[i + 1] + coeffs[i])
+    }
+    coeffs = next
   }
+
+  return coeffs.map(fmod)
+}
+
+function evaluationBasis (x, length) {
+  if (!Number.isSafeInteger(length) || length < 1) throw new RangeError('evaluation basis length must be positive')
+
+  const basis = new Array(length)
+  let power = 1n
+  const z = fmod(x)
+  for (let i = 0; i < length; i++) {
+    basis[i] = power
+    power = fmod(power * z)
+  }
+
+  return basis
+}
+
+function evaluatePolynomial (coeffs, x) {
+  return innerProduct(coeffs, evaluationBasis(x, coeffs.length))
+}
+
+function padScalars (scalars, length = nextPow2(Math.max(1, scalars.length))) {
+  if (!Number.isSafeInteger(length) || length < scalars.length) throw new RangeError('invalid scalar vector length')
+
+  const padded = new Array(length).fill(0n)
+  for (let i = 0; i < scalars.length; i++) padded[i] = fmod(scalars[i])
+  return padded
+}
+
+function polyCommitment (i, j, coeffs) {
+  const scalars = padScalars(coeffs)
+  return innerCommit(scalars, polynomialGenerators(i, j, scalars.length))
+}
+
+function bucketDigest (bucketCommitment) {
+  return hashToScalar(ptToBytes(bucketCommitment), DOMAIN_BUCKET_DIGEST)
+}
+
+function vertexBucketCommitment (rank, values) {
+  rank = validateRank(rank)
+  if (!Array.isArray(values) || values.length === 0) throw new Error('vertex bucket must contain at least one vertex')
+
+  const unique = new Map()
+  for (const value of values) {
+    const bytes = normalizeBytes(value)
+    unique.set(entryKey(bytes), bytes)
+  }
+
+  const roots = [...unique.values()].map(value => elementScalarForVertex(rank, value))
+  return polyCommitment(rank, rank, rootPolynomial(roots))
+}
+
+function vertexBucketPolynomial (rank, values) {
+  rank = validateRank(rank)
+  if (!Array.isArray(values) || values.length === 0) throw new Error('vertex bucket must contain at least one vertex')
+
+  const unique = new Map()
+  for (const value of values) {
+    const bytes = normalizeBytes(value)
+    unique.set(entryKey(bytes), bytes)
+  }
+
+  const roots = [...unique.values()].map(value => elementScalarForVertex(rank, value))
+  const coeffs = rootPolynomial(roots)
+  const commitment = polyCommitment(rank, rank, coeffs)
+
+  return {
+    rank,
+    values: [...unique.values()].map(value => b4a.from(value)),
+    roots,
+    coeffs,
+    commitment,
+    digest: bucketDigest(commitment),
+    degree: roots.length
+  }
+}
+
+function edgeBucketCommitment (fromRank, toRank, edges) {
+  fromRank = validateRank(fromRank)
+  toRank = validateRank(toRank)
+  if (toRank <= fromRank) throw new Error('edge bucket must point to a later rank')
+  if (!Array.isArray(edges) || edges.length === 0) throw new Error('edge bucket must contain at least one edge')
 
   const unique = new Map()
   for (const edge of edges) {
     const from = normalizeBytes(edge.from, 'from')
     const to = normalizeBytes(edge.to, 'to')
-    const fromRank = validateRank(edge.fromRank)
-    const toRank = validateRank(edge.toRank)
+    const edgeFromRank = validateRank(edge.fromRank)
+    const edgeToRank = validateRank(edge.toRank)
+    if (edgeFromRank !== fromRank || edgeToRank !== toRank) throw new Error('edge does not belong to bucket')
     unique.set(edgeKey(fromRank, from, toRank, to), { fromRank, from, toRank, to })
   }
 
-  let sum = 0n
-  for (const edge of unique.values()) {
-    sum = fmod(sum + edgeScalar(edge))
+  const roots = [...unique.values()].map(edge => elementScalarForEdge(edge.fromRank, edge.from, edge.toRank, edge.to))
+  return polyCommitment(fromRank, toRank, rootPolynomial(roots))
+}
+
+function edgeBucketPolynomial (fromRank, toRank, edges) {
+  fromRank = validateRank(fromRank)
+  toRank = validateRank(toRank)
+  if (toRank <= fromRank) throw new Error('edge bucket must point to a later rank')
+  if (!Array.isArray(edges) || edges.length === 0) throw new Error('edge bucket must contain at least one edge')
+
+  const unique = new Map()
+  for (const edge of edges) {
+    const from = normalizeBytes(edge.from, 'from')
+    const to = normalizeBytes(edge.to, 'to')
+    const edgeFromRank = validateRank(edge.fromRank)
+    const edgeToRank = validateRank(edge.toRank)
+    if (edgeFromRank !== fromRank || edgeToRank !== toRank) throw new Error('edge does not belong to bucket')
+    unique.set(edgeKey(fromRank, from, toRank, to), { fromRank, from, toRank, to })
   }
 
-  return fmod(sum * modinv(BigInt(unique.size)))
+  const bucketEdges = [...unique.values()]
+  const roots = bucketEdges.map(edge => elementScalarForEdge(edge.fromRank, edge.from, edge.toRank, edge.to))
+  const coeffs = rootPolynomial(roots)
+  const commitment = polyCommitment(fromRank, toRank, coeffs)
+
+  return {
+    fromRank,
+    toRank,
+    edges: bucketEdges.map(edge => ({
+      fromRank: edge.fromRank,
+      from: b4a.from(edge.from),
+      toRank: edge.toRank,
+      to: b4a.from(edge.to)
+    })),
+    roots,
+    coeffs,
+    commitment,
+    digest: bucketDigest(commitment),
+    degree: roots.length
+  }
+}
+
+function vertexBucketScalar (rank, values) {
+  return bucketDigest(vertexBucketCommitment(rank, values))
+}
+
+function edgeBucketScalar (fromRank, toRank, edges) {
+  return bucketDigest(edgeBucketCommitment(fromRank, toRank, edges))
+}
+
+function edgeLayerScalar (edges) {
+  if (!Array.isArray(edges) || edges.length === 0) throw new Error('edge bucket must contain at least one edge')
+
+  const first = edges[0]
+  return edgeBucketScalar(validateRank(first.fromRank), validateRank(first.toRank), edges)
 }
 
 function termForEdgeBucket (fromRank, toRank, edges) {
@@ -247,31 +432,7 @@ function termForEdgeBucket (fromRank, toRank, edges) {
       throw new Error('edge does not belong to bucket')
     }
   }
-  return ptScale(edgeLayerScalar(edges), coordinateGenerator(fromRank, toRank))
-}
-
-function layerAdjustment (rank, selected, complements) {
-  selected = normalizeBytes(selected, 'selected')
-  if (!Array.isArray(complements)) throw new TypeError('complements must be an array')
-
-  const values = [selected]
-  for (const complement of complements) values.push(normalizeBytes(complement, 'complement'))
-
-  const unique = new Map()
-  for (const value of values) unique.set(entryKey(value), value)
-
-  if (!unique.has(entryKey(selected))) throw new Error('selected value missing from layer')
-  if (unique.size !== values.length) throw new Error('layer adjustment contains duplicate entries')
-
-  const avg = layerScalar([...unique.values()])
-  const delta = fmod(avg - hashEntry(selected))
-
-  return {
-    rank: validateRank(rank),
-    multiplicity: unique.size,
-    delta,
-    term: ptScale(delta, generator(rank))
-  }
+  return ptScale(edgeBucketScalar(fromRank, toRank, edges), coordinateGenerator(fromRank, toRank))
 }
 
 function innerProduct (a, b) {
@@ -307,9 +468,51 @@ function rankGenerators (length) {
   return gens
 }
 
+function graphVectorLength (maxRank) {
+  maxRank = Math.max(1, maxRank)
+  return nextPow2(maxRank * maxRank)
+}
+
+function graphCoordinateIndex (i, j, maxRank) {
+  i = validateRank(i)
+  j = validateRank(j)
+  if (!Number.isSafeInteger(maxRank) || maxRank < 1) throw new RangeError('maxRank must be positive')
+  if (i > maxRank || j > maxRank) throw new RangeError('coordinate outside graph dimension')
+  return (i - 1) * maxRank + (j - 1)
+}
+
+function graphCoordinateFromIndex (index, maxRank) {
+  return {
+    i: Math.floor(index / maxRank) + 1,
+    j: (index % maxRank) + 1
+  }
+}
+
+function graphGenerators (maxRank, length = graphVectorLength(maxRank)) {
+  if (!Number.isSafeInteger(length) || length < 1) throw new RangeError('generator length must be positive')
+
+  const gens = []
+  const coordinateCount = maxRank * maxRank
+  for (let index = 0; index < length; index++) {
+    if (index < coordinateCount) {
+      const coord = graphCoordinateFromIndex(index, maxRank)
+      gens.push(coordinateGenerator(coord.i, coord.j))
+    } else {
+      gens.push(coordinateGenerator(maxRank + 1, index - coordinateCount + 1))
+    }
+  }
+  return gens
+}
+
 function rankBasis (rank, length) {
   const basis = new Array(length).fill(0n)
   basis[rank - 1] = 1n
+  return basis
+}
+
+function coordinateBasis (i, j, maxRank, length = graphVectorLength(maxRank)) {
+  const basis = new Array(length).fill(0n)
+  basis[graphCoordinateIndex(i, j, maxRank)] = 1n
   return basis
 }
 
@@ -317,17 +520,45 @@ function vectorScalarsFromLayers (layers, maxRank) {
   const scalars = new Array(vectorLength(maxRank)).fill(0n)
 
   for (const [rank, layer] of layers) {
-    scalars[rank - 1] = layerScalar([...layer.values()])
+    scalars[rank - 1] = vertexBucketScalar(rank, [...layer.values()])
   }
 
   return scalars
 }
 
-function ipaProveOpening (commitment, scalars, rank, valueScalar) {
+function graphScalarsFromBuckets (layers, edges, maxRank) {
+  const scalars = new Array(graphVectorLength(maxRank)).fill(0n)
+
+  for (const [rank, layer] of layers) {
+    scalars[graphCoordinateIndex(rank, rank, maxRank)] = vertexBucketScalar(rank, [...layer.values()])
+  }
+
+  for (const bucket of edges.values()) {
+    scalars[graphCoordinateIndex(bucket.fromRank, bucket.toRank, maxRank)] = edgeBucketScalar(
+      bucket.fromRank,
+      bucket.toRank,
+      [...bucket.edges.values()]
+    )
+  }
+
+  return scalars
+}
+
+function ipaProveInnerProduct (commitment, scalars, basis, valueScalar, generators) {
+  if (!Array.isArray(scalars) || !Array.isArray(basis) || !Array.isArray(generators)) {
+    throw new TypeError('IPA inputs must be arrays')
+  }
+  if (scalars.length !== basis.length || scalars.length !== generators.length) {
+    throw new Error('IPA input dimensions mismatch')
+  }
+  if (scalars.length < 1 || (scalars.length & (scalars.length - 1)) !== 0) {
+    throw new Error('IPA length must be a power of two')
+  }
+
   const length = scalars.length
   let a = scalars.slice()
-  let b = rankBasis(rank, length)
-  let G = rankGenerators(length)
+  let b = basis.slice()
+  let G = generators.slice()
   let P = ptAdd(commitment, ptScale(valueScalar, ipaGenerator()))
   const rounds = []
 
@@ -361,19 +592,19 @@ function ipaProveOpening (commitment, scalars, rank, valueScalar) {
   }
 }
 
-function ipaVerifyOpening (commitment, rank, valueScalar, proof) {
+function ipaVerifyInnerProduct (commitment, basis, valueScalar, proof, generators) {
   if (!proof || !Number.isSafeInteger(proof.length) || proof.length < 1) {
     return { valid: false, reason: 'invalid IPA proof length' }
   }
-  if (proof.length !== vectorLength(proof.maxRank)) {
+  if (!Array.isArray(basis) || !Array.isArray(generators)) {
+    return { valid: false, reason: 'invalid IPA verifier inputs' }
+  }
+  if (basis.length !== proof.length || generators.length !== proof.length) {
     return { valid: false, reason: 'invalid IPA proof dimension' }
   }
-  if (rank > proof.maxRank || rank < 1) {
-    return { valid: false, reason: 'rank outside proof dimension' }
-  }
 
-  let b = rankBasis(rank, proof.length)
-  let G = rankGenerators(proof.length)
+  let b = basis.slice()
+  let G = generators.slice()
   let P = ptAdd(commitment, ptScale(valueScalar, ipaGenerator()))
 
   for (const round of proof.rounds) {
@@ -404,6 +635,94 @@ function ipaVerifyOpening (commitment, rank, valueScalar, proof) {
   if (!ptEq(P, expected)) return { valid: false, reason: 'IPA final check failed' }
 
   return { valid: true, reason: 'OK' }
+}
+
+function ipaProveOpening (commitment, scalars, rank, valueScalar) {
+  const length = scalars.length
+  return ipaProveInnerProduct(
+    commitment,
+    scalars,
+    rankBasis(rank, length),
+    valueScalar,
+    rankGenerators(length)
+  )
+}
+
+function ipaVerifyOpening (commitment, rank, valueScalar, proof) {
+  if (!proof || !Number.isSafeInteger(proof.length) || proof.length < 1) {
+    return { valid: false, reason: 'invalid IPA proof length' }
+  }
+  if (proof.length !== vectorLength(proof.maxRank)) {
+    return { valid: false, reason: 'invalid IPA proof dimension' }
+  }
+  if (rank > proof.maxRank || rank < 1) {
+    return { valid: false, reason: 'rank outside proof dimension' }
+  }
+
+  return ipaVerifyInnerProduct(
+    commitment,
+    rankBasis(rank, proof.length),
+    valueScalar,
+    proof,
+    rankGenerators(proof.length)
+  )
+}
+
+function ipaProveCoordinateOpening (commitment, scalars, i, j, maxRank, valueScalar) {
+  const length = graphVectorLength(maxRank)
+  if (scalars.length !== length) throw new Error('invalid graph scalar dimension')
+
+  return ipaProveInnerProduct(
+    commitment,
+    scalars,
+    coordinateBasis(i, j, maxRank, length),
+    valueScalar,
+    graphGenerators(maxRank, length)
+  )
+}
+
+function ipaVerifyCoordinateOpening (commitment, i, j, maxRank, valueScalar, proof) {
+  if (!proof || !Number.isSafeInteger(proof.length) || proof.length < 1) {
+    return { valid: false, reason: 'invalid IPA proof length' }
+  }
+  if (proof.length !== graphVectorLength(maxRank)) {
+    return { valid: false, reason: 'invalid graph IPA proof dimension' }
+  }
+
+  return ipaVerifyInnerProduct(
+    commitment,
+    coordinateBasis(i, j, maxRank, proof.length),
+    valueScalar,
+    proof,
+    graphGenerators(maxRank, proof.length)
+  )
+}
+
+function ipaProvePolynomialEvaluation (i, j, coeffs, x, valueScalar) {
+  const scalars = padScalars(coeffs)
+  const commitment = innerCommit(scalars, polynomialGenerators(i, j, scalars.length))
+
+  return ipaProveInnerProduct(
+    commitment,
+    scalars,
+    evaluationBasis(x, scalars.length),
+    valueScalar,
+    polynomialGenerators(i, j, scalars.length)
+  )
+}
+
+function ipaVerifyPolynomialEvaluation (i, j, bucketCommitment, x, valueScalar, proof) {
+  if (!proof || !Number.isSafeInteger(proof.length) || proof.length < 1) {
+    return { valid: false, reason: 'invalid polynomial IPA proof length' }
+  }
+
+  return ipaVerifyInnerProduct(
+    bucketCommitment,
+    evaluationBasis(x, proof.length),
+    valueScalar,
+    proof,
+    polynomialGenerators(i, j, proof.length)
+  )
 }
 
 function commitmentForEntries (entries) {
@@ -634,6 +953,31 @@ class RankedLog {
         })))
   }
 
+  edgeBucket (fromRank, toRank) {
+    fromRank = validateRank(fromRank)
+    toRank = validateRank(toRank)
+    const bucket = this._edges.get(coordinateKey(fromRank, toRank))
+    if (!bucket) return []
+
+    return [...bucket.edges.values()]
+      .sort((a, b) => edgeKey(a.fromRank, a.from, a.toRank, a.to)
+        .localeCompare(edgeKey(b.fromRank, b.from, b.toRank, b.to)))
+      .map(edge => ({
+        fromRank: edge.fromRank,
+        from: b4a.from(edge.from),
+        toRank: edge.toRank,
+        to: b4a.from(edge.to)
+      }))
+  }
+
+  hasEdge (fromRank, from, toRank, to) {
+    fromRank = validateRank(fromRank)
+    toRank = validateRank(toRank)
+    const bucket = this._edges.get(coordinateKey(fromRank, toRank))
+    if (!bucket) return false
+    return bucket.edges.has(edgeKey(fromRank, normalizeBytes(from, 'from'), toRank, normalizeBytes(to, 'to')))
+  }
+
   transitions () {
     return this.edges()
   }
@@ -714,7 +1058,7 @@ class RankedLog {
     }
   }
 
-  proveEntry ({ rank, value, bytes }) {
+  proveVertex ({ rank, value, bytes }) {
     const target = normalizeBytes(value === undefined ? bytes : value)
     rank = validateRank(rank)
 
@@ -722,39 +1066,70 @@ class RankedLog {
       throw new Error('entry is not present in ranked log')
     }
 
-    const valueScalar = hashEntry(target)
-    const scalars = vectorScalarsFromLayers(this._layers, this.maxRank)
-    const layer = this.layer(rank)
-    const complements = layer.filter(entry => !sameBytes(entry, target))
-    const adjustments = []
-
-    if (complements.length > 0) {
-      const adjustment = layerAdjustment(rank, target, complements)
-      scalars[rank - 1] = valueScalar
-      adjustments.push({
-        rank,
-        selected: b4a.from(target),
-        complements,
-        multiplicity: adjustment.multiplicity
-      })
-    }
-
-    const branchCommitment = innerCommit(scalars, rankGenerators(scalars.length))
-    const opening = ipaProveOpening(branchCommitment, scalars, rank, valueScalar)
+    const bucket = vertexBucketPolynomial(rank, this.layer(rank))
+    const z = elementScalarForVertex(rank, target)
+    const graphScalars = graphScalarsFromBuckets(this._layers, this._edges, this.maxRank)
+    const outerOpening = ipaProveCoordinateOpening(this.commitmentPoint(), graphScalars, rank, rank, this.maxRank, bucket.digest)
+    const innerOpening = ipaProvePolynomialEvaluation(rank, rank, bucket.coeffs, z, 0n)
 
     return {
-      type: 'hyperdag-entry-proof-v1',
+      type: 'hyperdag-vertex-membership-proof-v1',
       rank,
       value: b4a.from(target),
+      bucketCommitment: b4a.from(ptToBytes(bucket.commitment)),
+      bucketDigest: bucket.digest,
+      outerOpening,
+      innerOpening,
+      degree: bucket.degree,
       maxRank: this.maxRank,
-      adjustments,
-      opening,
+      state: this.state()
+    }
+  }
+
+  proveEntry (opts) {
+    return this.proveVertex(opts)
+  }
+
+  proveEdge ({ fromRank, from, toRank, to }) {
+    fromRank = validateRank(fromRank)
+    toRank = validateRank(toRank)
+    from = normalizeBytes(from, 'from')
+    to = normalizeBytes(to, 'to')
+
+    if (!this.hasEdge(fromRank, from, toRank, to)) {
+      throw new Error('edge is not present in ranked log')
+    }
+
+    const bucket = edgeBucketPolynomial(fromRank, toRank, this.edgeBucket(fromRank, toRank))
+    const z = elementScalarForEdge(fromRank, from, toRank, to)
+    const graphScalars = graphScalarsFromBuckets(this._layers, this._edges, this.maxRank)
+    const outerOpening = ipaProveCoordinateOpening(this.commitmentPoint(), graphScalars, fromRank, toRank, this.maxRank, bucket.digest)
+    const innerOpening = ipaProvePolynomialEvaluation(fromRank, toRank, bucket.coeffs, z, 0n)
+
+    return {
+      type: 'hyperdag-edge-membership-proof-v1',
+      coordinate: { fromRank, toRank },
+      edge: { from: b4a.from(from), to: b4a.from(to) },
+      bucketCommitment: b4a.from(ptToBytes(bucket.commitment)),
+      bucketDigest: bucket.digest,
+      outerOpening,
+      innerOpening,
+      degree: bucket.degree,
+      maxRank: this.maxRank,
       state: this.state()
     }
   }
 
   verifyEntry (proof) {
-    return RankedLog.verifyEntry(this.state(), proof)
+    return RankedLog.verifyVertex(this.state(), proof)
+  }
+
+  verifyVertex (proof) {
+    return RankedLog.verifyVertex(this.state(), proof)
+  }
+
+  verifyEdge (proof) {
+    return RankedLog.verifyEdge(this.state(), proof)
   }
 
   toJSON () {
@@ -817,10 +1192,10 @@ class RankedLog {
     throw new Error('proof witnesses are not materialized by linear IPA proofs')
   }
 
-  static verifyEntry (expectedState, proof) {
+  static verifyVertex (expectedState, proof) {
     try {
       const expected = stateCommitment(expectedState)
-      if (!proof || proof.type !== 'hyperdag-entry-proof-v1') {
+      if (!proof || proof.type !== 'hyperdag-vertex-membership-proof-v1') {
         return { valid: false, reason: 'unsupported proof' }
       }
 
@@ -836,42 +1211,109 @@ class RankedLog {
         return { valid: false, reason: 'maxRank mismatch' }
       }
 
-      const vertexCommitment = expected.vertexCommitment || expected.rankCommitment
-      const edgeCommitment = expected.edgeCommitment || expected.transitionCommitment
+      const stateCheck = verifyStateSlices(expected)
+      if (!stateCheck.valid) return stateCheck
 
-      if (vertexCommitment && edgeCommitment) {
-        const combined = ptAdd(ptFromBytes(vertexCommitment), ptFromBytes(edgeCommitment))
-        if (!b4a.from(ptToBytes(combined)).equals(expected.commitment)) {
-          return { valid: false, reason: 'state commitment mismatch' }
-        }
+      const bucketCommitment = ptFromBytes(proof.bucketCommitment)
+      const digest = bucketDigest(bucketCommitment)
+      if (proof.bucketDigest !== undefined && !sameScalar(proof.bucketDigest, digest)) {
+        return { valid: false, reason: 'bucket digest mismatch' }
       }
 
-      let branchCommitment = ptFromBytes(vertexCommitment || expected.commitment)
-      const adjustments = proof.adjustments || []
-      if (!Array.isArray(adjustments)) return { valid: false, reason: 'invalid adjustments' }
-
-      for (const adjustment of adjustments) {
-        const adjustmentRank = validateRank(adjustment.rank)
-        const selected = normalizeBytes(adjustment.selected, 'selected')
-        const complements = adjustment.complements || []
-        const computed = layerAdjustment(adjustmentRank, selected, complements)
-
-        if (computed.multiplicity !== adjustment.multiplicity) {
-          return { valid: false, reason: 'multiplicity mismatch' }
-        }
-        if (adjustmentRank === rank && !sameBytes(selected, value)) {
-          return { valid: false, reason: 'target adjustment mismatch' }
-        }
-
-        branchCommitment = ptAdd(branchCommitment, ptScale(-1n, computed.term))
+      if (proof.degree !== undefined && proof.innerOpening.length !== nextPow2(proof.degree + 1)) {
+        return { valid: false, reason: 'invalid bucket proof dimension' }
       }
 
-      return ipaVerifyOpening(
-        branchCommitment,
+      const outer = ipaVerifyCoordinateOpening(
+        ptFromBytes(expected.commitment),
         rank,
-        hashEntry(value),
-        { ...proof.opening, maxRank }
+        rank,
+        maxRank,
+        digest,
+        proof.outerOpening
       )
+      if (!outer.valid) return outer
+
+      const inner = ipaVerifyPolynomialEvaluation(
+        rank,
+        rank,
+        bucketCommitment,
+        elementScalarForVertex(rank, value),
+        0n,
+        proof.innerOpening
+      )
+      if (!inner.valid) return inner
+
+      return { valid: true, reason: 'OK' }
+    } catch (err) {
+      return { valid: false, reason: err.message }
+    }
+  }
+
+  static verifyEntry (expectedState, proof) {
+    return RankedLog.verifyVertex(expectedState, proof)
+  }
+
+  static verifyEdge (expectedState, proof) {
+    try {
+      const expected = stateCommitment(expectedState)
+      if (!proof || proof.type !== 'hyperdag-edge-membership-proof-v1') {
+        return { valid: false, reason: 'unsupported proof' }
+      }
+
+      const coordinate = proof.coordinate || {}
+      const edge = proof.edge || {}
+      const fromRank = validateRank(coordinate.fromRank)
+      const toRank = validateRank(coordinate.toRank)
+      if (toRank <= fromRank) return { valid: false, reason: 'edge must point to a later rank' }
+      const from = normalizeBytes(edge.from, 'from')
+      const to = normalizeBytes(edge.to, 'to')
+      const maxRank = proof.maxRank
+
+      if (!Number.isSafeInteger(maxRank) || maxRank < 1) {
+        return { valid: false, reason: 'invalid proof maxRank' }
+      }
+      if (fromRank > maxRank || toRank > maxRank) {
+        return { valid: false, reason: 'coordinate outside proof dimension' }
+      }
+      if (expected.maxRank !== undefined && maxRank !== expected.maxRank) {
+        return { valid: false, reason: 'maxRank mismatch' }
+      }
+
+      const stateCheck = verifyStateSlices(expected)
+      if (!stateCheck.valid) return stateCheck
+
+      const bucketCommitment = ptFromBytes(proof.bucketCommitment)
+      const digest = bucketDigest(bucketCommitment)
+      if (proof.bucketDigest !== undefined && !sameScalar(proof.bucketDigest, digest)) {
+        return { valid: false, reason: 'bucket digest mismatch' }
+      }
+
+      if (proof.degree !== undefined && proof.innerOpening.length !== nextPow2(proof.degree + 1)) {
+        return { valid: false, reason: 'invalid bucket proof dimension' }
+      }
+
+      const outer = ipaVerifyCoordinateOpening(
+        ptFromBytes(expected.commitment),
+        fromRank,
+        toRank,
+        maxRank,
+        digest,
+        proof.outerOpening
+      )
+      if (!outer.valid) return outer
+
+      const inner = ipaVerifyPolynomialEvaluation(
+        fromRank,
+        toRank,
+        bucketCommitment,
+        elementScalarForEdge(fromRank, from, toRank, to),
+        0n,
+        proof.innerOpening
+      )
+      if (!inner.valid) return inner
+
+      return { valid: true, reason: 'OK' }
     } catch (err) {
       return { valid: false, reason: err.message }
     }
@@ -886,31 +1328,53 @@ module.exports = {
   commitmentForEdges,
   challenge,
   coordinateGenerator,
+  coordinateBasis,
+  elementScalarForVertex,
+  elementScalarForEdge,
   entryKey,
   edgeKey,
   edgeScalar,
   edgeLayerScalar,
+  edgeBucketScalar,
+  edgeBucketCommitment,
+  edgeBucketPolynomial,
+  evaluatePolynomial,
+  evaluationBasis,
   fmod,
   generator,
+  graphScalarsFromBuckets,
+  graphVectorLength,
   hashEntry,
   hashToScalar,
   innerCommit,
   innerProduct,
+  ipaProveCoordinateOpening,
+  ipaProveInnerProduct,
   ipaProveOpening,
+  ipaProvePolynomialEvaluation,
+  ipaVerifyCoordinateOpening,
+  ipaVerifyInnerProduct,
   ipaVerifyOpening,
+  ipaVerifyPolynomialEvaluation,
   modinv,
   normalizeBytes,
+  polynomialGenerator,
+  polynomialGenerators,
+  polyCommitment,
   ptAdd,
   ptEq,
   ptFromBytes,
   ptScale,
   ptToBytes,
+  rootPolynomial,
   sameBytes,
-  layerScalar,
-  layerAdjustment,
+  bucketDigest,
   termForEntry,
   termForLayer,
   termForEdgeBucket,
+  vertexBucketScalar,
+  vertexBucketCommitment,
+  vertexBucketPolynomial,
   transitionKey: edgeKey,
   transitionScalar: edgeScalar,
   transitionLayerScalar: edgeLayerScalar,

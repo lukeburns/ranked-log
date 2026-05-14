@@ -20,8 +20,9 @@ console.log(state.commitment.toString('hex'))
 console.log(RankedLog.verifyEntry(state, proof)) // { valid: true, reason: 'OK' }
 ```
 
-The same proof API also works for a forked rank by carrying the complement and
-multiplicity for that rank:
+The same proof API also works for a forked rank. The rank bucket is committed as
+an IPA polynomial set, so membership is opened without sending complement
+entries:
 
 ```js
 const forked = new RankedLog()
@@ -31,8 +32,16 @@ forked.append('d')
 
 const proof = forked.proveEntry({ rank: 2, value: 'b' })
 
-console.log(proof.adjustments[0].multiplicity) // 2
+console.log(proof.degree) // 2
 console.log(RankedLog.verifyEntry(forked.state(), proof)) // { valid: true, reason: 'OK' }
+```
+
+Edges have the same membership proof shape:
+
+```js
+const proof = forked.proveEdge({ fromRank: 2, from: 'b', toRank: 3, to: 'd' })
+
+console.log(RankedLog.verifyEdge(forked.state(), proof)) // { valid: true, reason: 'OK' }
 ```
 
 Branch-wise construction commits to the same state:
@@ -79,7 +88,7 @@ Append multiple entries at `log.maxRank + 1`.
 Entries in a layer are deduped by byte value. The layer contribution is:
 
 ```text
-(1 / layer size) * sum h(vertex.bytes) * G(rank, rank)
+H(CommitSet(V_rank)) * G(rank, rank)
 ```
 
 #### `const entry = log.addAtRank(rank, bytes)`
@@ -151,18 +160,32 @@ Return all vertices as `{ rank, value }` objects, sorted by rank and then value.
 
 Return graph edges as `{ fromRank, from, toRank, to }` objects.
 
-#### `const proof = log.proveEntry({ rank, value })`
+#### `const proof = log.proveVertex({ rank, value })`
 
-Create an unsigned IPA opening proof for an entry.
+Create an unsigned IPA set-membership proof for a vertex.
 
-For linear ranks, the IPA proof opens the rank commitment directly. For forked
-ranks, the proof includes the complement entries and multiplicity for that rank,
-derives the branch commitment where the claim is true, and opens that branch
-commitment.
+`log.proveEntry()` is an alias for vertex proofs.
 
-#### `const result = RankedLog.verifyEntry(state, proof)`
+#### `const proof = log.proveEdge({ fromRank, from, toRank, to })`
 
-Verify a proof against an expected state or commitment.
+Create an unsigned IPA set-membership proof for an edge.
+
+Each membership proof has two openings:
+
+```text
+outer opening: H(bucketCommitment) is opened at graph coordinate G(i,j)
+inner opening: P_bucket(h(element)) = 0 is opened against bucketCommitment
+```
+
+#### `const result = RankedLog.verifyVertex(state, proof)`
+
+Verify a vertex proof against an expected state or commitment.
+
+`RankedLog.verifyEntry()` is an alias for vertex verification.
+
+#### `const result = RankedLog.verifyEdge(state, proof)`
+
+Verify an edge proof against an expected state or commitment.
 
 Returns `{ valid, reason }`.
 
@@ -176,25 +199,30 @@ Restore a ranked log and check that the serialized commitment matches the entrie
 
 ## Commitment
 
-We use a graph-specific double sum.
+We use a graph-specific double sum over IPA set buckets.
 
 Let `V_i` be the vertices at rank `i`, and let `E_i,j` be the edges from rank
 `i` to rank `j`.
 
 ```text
-C = sum_i avg(V_i) * G(i, i)
-  + sum_i sum_j avg(E_i,j) * G(i, j)
+C = sum_i H(CommitSet(V_i)) * G(i, i)
+  + sum_i sum_j H(CommitSet(E_i,j)) * G(i, j)
 ```
 
-where:
+Each `CommitSet(S)` is an IPA polynomial commitment to the root polynomial:
 
 ```text
-avg(V_i) = (1 / |V_i|) * sum h(vertex.bytes)
-avg(E_i,j) = (1 / |E_i,j|) * sum h(from, to)
+P_S(x) = product_{s in S} (x - h(s))
 ```
 
-The diagonal terms `G(i, i)` are the original rank/layer commitment. Off-diagonal
-terms `G(i, j)` commit to graph continuity.
+Membership is verified by opening:
+
+```text
+P_S(h(s)) = 0
+```
+
+The diagonal terms `G(i, i)` commit to vertex sets. Off-diagonal terms `G(i, j)`
+commit to edge sets and graph continuity.
 
 The implementation exposes these slices as:
 
@@ -218,3 +246,7 @@ a | c | d
 
 The edge commitment distinguishes them because the first has both `b -> d` and
 `c -> d`, while the second only has `c -> d`.
+
+Merging is deterministic by unioning bucket elements and recomputing the bucket
+polynomial commitment. This gives compact IPA membership openings, but it is not
+an additive accumulator for set union.

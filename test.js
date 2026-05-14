@@ -2,17 +2,28 @@
 
 const {
   RankedLog,
+  bucketDigest,
   commitmentForEdges,
   commitmentForEntries,
-  hashEntry,
+  edgeBucketCommitment,
+  elementScalarForEdge,
+  elementScalarForVertex,
+  evaluatePolynomial,
+  fmod,
   generator,
+  hashEntry,
+  ipaProvePolynomialEvaluation,
+  ipaVerifyPolynomialEvaluation,
+  polyCommitment,
   ptEq,
   ptFromBytes,
   ptScale,
   ptToBytes,
+  rootPolynomial,
   termForEntry,
   termForLayer,
-  termForEdgeBucket
+  termForEdgeBucket,
+  vertexBucketCommitment
 } = require('./index')
 const b4a = require('b4a')
 
@@ -110,7 +121,7 @@ test('same-rank layer is commutative', () => {
   assertBufferEqual(bc.commitment(), cb.commitment(), '{b,c} and {c,b} should commit the same')
 })
 
-test('a | {b,c} | d matches averaged layer construction', () => {
+test('a | {b,c} | d matches set-bucket layer construction', () => {
   const log = new RankedLog()
   log.append(b('a'))
   log.appendLayer([b('b'), b('c')])
@@ -120,10 +131,10 @@ test('a | {b,c} | d matches averaged layer construction', () => {
   expected = expected.add(termForLayer(2, [b('b'), b('c')]))
   expected = expected.add(termForEntry(3, b('d')))
 
-  assert(ptEq(log.rankCommitmentPoint(), expected), 'rank commitment should use averaged rank layers')
+  assert(ptEq(log.rankCommitmentPoint(), expected), 'rank commitment should use diagonal set buckets')
 })
 
-test('a | {b,c} | d is homomorphic with branch-wise construction', () => {
+test('a | {b,c} | d is deterministic with branch-wise union', () => {
   const segmentWise = new RankedLog()
   segmentWise.append(b('a'))
   segmentWise.appendLayer([b('b'), b('c')])
@@ -164,7 +175,7 @@ test('edge commitment distinguishes branch continuation', () => {
   assertBufferNotEqual(terminated.commitment(), sharedTail.commitment())
 })
 
-test('edge commitment matches double-sum edge buckets', () => {
+test('edge commitment matches set-bucket coordinate terms', () => {
   const log = new RankedLog()
   log.append(b('a'))
   log.appendLayer([b('b'), b('c')])
@@ -271,56 +282,252 @@ test('layer inspection is deterministic', () => {
   assertEqual(log.layer(1).map(value => value.toString()).join(','), 'a,b,c')
 })
 
-console.log('\n── Suite 3: Unsigned Entry Verification ────────────────')
+console.log('\n── Suite 3: Polynomial Set Buckets ─────────────────────')
 
-test('valid entry proof verifies against expected state', () => {
+test('root polynomial evaluates to zero for members', () => {
+  const roots = [elementScalarForVertex(1, b('a')), elementScalarForVertex(1, b('b'))]
+  const coeffs = rootPolynomial(roots)
+
+  assertEqual(evaluatePolynomial(coeffs, roots[0]), 0n)
+  assertEqual(evaluatePolynomial(coeffs, roots[1]), 0n)
+})
+
+test('root polynomial does not evaluate to zero for non-members', () => {
+  const roots = [elementScalarForVertex(1, b('a')), elementScalarForVertex(1, b('b'))]
+  const coeffs = rootPolynomial(roots)
+  const outsider = elementScalarForVertex(1, b('x'))
+
+  assert(evaluatePolynomial(coeffs, outsider) !== 0n, 'non-member should not be a root')
+})
+
+test('polynomial commitment opens validly at a member root', () => {
+  const roots = [elementScalarForVertex(1, b('a')), elementScalarForVertex(1, b('b'))]
+  const coeffs = rootPolynomial(roots)
+  const commitment = polyCommitment(1, 1, coeffs)
+  const proof = ipaProvePolynomialEvaluation(1, 1, coeffs, roots[0], 0n)
+
+  valid(ipaVerifyPolynomialEvaluation(1, 1, commitment, roots[0], 0n, proof))
+})
+
+test('polynomial opening fails for a mutated root', () => {
+  const roots = [elementScalarForVertex(1, b('a')), elementScalarForVertex(1, b('b'))]
+  const coeffs = rootPolynomial(roots)
+  const commitment = polyCommitment(1, 1, coeffs)
+  const proof = ipaProvePolynomialEvaluation(1, 1, coeffs, roots[0], 0n)
+  const outsider = elementScalarForVertex(1, b('x'))
+
+  invalid(ipaVerifyPolynomialEvaluation(1, 1, commitment, outsider, 0n, proof))
+})
+
+test('polynomial opening fails for a wrong claimed value', () => {
+  const roots = [elementScalarForVertex(1, b('a')), elementScalarForVertex(1, b('b'))]
+  const coeffs = rootPolynomial(roots)
+  const commitment = polyCommitment(1, 1, coeffs)
+  const proof = ipaProvePolynomialEvaluation(1, 1, coeffs, roots[0], 0n)
+
+  invalid(ipaVerifyPolynomialEvaluation(1, 1, commitment, roots[0], 1n, proof))
+})
+
+test('polynomial opening fails for a mutated proof', () => {
+  const roots = [elementScalarForVertex(1, b('a')), elementScalarForVertex(1, b('b'))]
+  const coeffs = rootPolynomial(roots)
+  const commitment = polyCommitment(1, 1, coeffs)
+  const proof = ipaProvePolynomialEvaluation(1, 1, coeffs, roots[0], 0n)
+  proof.finalScalar = fmod(proof.finalScalar + 1n)
+
+  invalid(ipaVerifyPolynomialEvaluation(1, 1, commitment, roots[0], 0n, proof))
+})
+
+test('bucket digest is derived from bucket commitment', () => {
+  const commitment = vertexBucketCommitment(1, [b('a'), b('b')])
+  const digest = bucketDigest(commitment)
+
+  assertEqual(typeof digest, 'bigint')
+  assert(digest !== 0n, 'bucket digest should be a non-zero-looking scalar')
+})
+
+test('vertex bucket commitment dedupes duplicate elements', () => {
+  const withDupes = vertexBucketCommitment(1, [b('a'), b('a'), b('b')])
+  const deduped = vertexBucketCommitment(1, [b('a'), b('b')])
+
+  assert(ptEq(withDupes, deduped), 'duplicate vertices should not change the set bucket')
+})
+
+test('edge bucket commitment is commutative', () => {
+  const left = edgeBucketCommitment(1, 2, [
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('b') },
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('c') }
+  ])
+  const right = edgeBucketCommitment(1, 2, [
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('c') },
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('b') }
+  ])
+
+  assert(ptEq(left, right), 'edge bucket commitment should ignore set ordering')
+})
+
+test('edge bucket commitment dedupes duplicate edges', () => {
+  const withDupes = edgeBucketCommitment(1, 2, [
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('b') },
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('b') }
+  ])
+  const deduped = edgeBucketCommitment(1, 2, [
+    { fromRank: 1, from: b('a'), toRank: 2, to: b('b') }
+  ])
+
+  assert(ptEq(withDupes, deduped), 'duplicate edges should not change the set bucket')
+})
+
+console.log('\n── Suite 4: Unsigned Membership Verification ───────────')
+
+test('valid vertex proof verifies against expected state', () => {
   const log = new RankedLog()
   log.append(b('a'))
   log.append(b('b'))
   log.append(b('d'))
 
-  const proof = log.proveEntry({ rank: 2, value: b('b') })
-  valid(RankedLog.verifyEntry(log.state(), proof))
-  valid(log.verifyEntry(proof))
-})
-
-test('entry proof for a degenerate layer verifies with complement witness', () => {
-  const log = new RankedLog()
-  log.append(b('a'))
-  log.appendLayer([b('b'), b('c')])
-  log.append(b('d'))
-
-  const proof = log.proveEntry({ rank: 2, value: b('b') })
-
-  assertEqual(proof.adjustments.length, 1)
-  assertEqual(proof.adjustments[0].multiplicity, 2)
-  assertEqual(proof.adjustments[0].complements.length, 1)
-  assertBufferEqual(proof.adjustments[0].complements[0], b('c'))
+  const proof = log.proveVertex({ rank: 2, value: b('b') })
+  valid(RankedLog.verifyVertex(log.state(), proof))
+  valid(log.verifyVertex(proof))
   valid(RankedLog.verifyEntry(log.state(), proof))
 })
 
-test('degenerate proof fails with wrong complement', () => {
+test('vertex proof for a degenerate layer verifies without complements', () => {
   const log = new RankedLog()
   log.append(b('a'))
   log.appendLayer([b('b'), b('c')])
   log.append(b('d'))
 
-  const proof = log.proveEntry({ rank: 2, value: b('b') })
-  proof.adjustments[0].complements[0] = b('x')
+  const proof = log.proveVertex({ rank: 2, value: b('b') })
 
-  invalid(RankedLog.verifyEntry(log.state(), proof))
+  assertEqual(proof.type, 'hyperdag-vertex-membership-proof-v1')
+  assertEqual(proof.degree, 2)
+  assert(proof.bucketCommitment.length === 32, 'proof should carry bucket commitment')
+  valid(RankedLog.verifyVertex(log.state(), proof))
 })
 
-test('degenerate proof fails with wrong multiplicity', () => {
+test('valid edge proof verifies against expected state', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b'), b('d')])
+  log.addBranch([b('a'), b('c'), b('d')])
+
+  const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
+
+  assertEqual(proof.type, 'hyperdag-edge-membership-proof-v1')
+  assertEqual(proof.degree, 2)
+  valid(RankedLog.verifyEdge(log.state(), proof))
+  valid(log.verifyEdge(proof))
+})
+
+test('non-adjacent edge proof verifies against expected state', () => {
+  const log = new RankedLog()
+  log.addEdge(1, b('a'), 3, b('d'))
+
+  const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 3, to: b('d') })
+
+  assertEqual(proof.coordinate.toRank, 3)
+  valid(RankedLog.verifyEdge(log.state(), proof))
+})
+
+test('edge proof rejects wrong edge', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b'), b('d')])
+
+  const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
+  proof.edge.from = b('x')
+
+  invalid(RankedLog.verifyEdge(log.state(), proof))
+})
+
+test('edge proof rejects wrong target value', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b'), b('d')])
+
+  const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
+  proof.edge.to = b('x')
+
+  invalid(RankedLog.verifyEdge(log.state(), proof))
+})
+
+test('edge proof rejects wrong coordinate', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b'), b('d')])
+
+  const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
+  proof.coordinate.fromRank = 1
+
+  invalid(RankedLog.verifyEdge(log.state(), proof))
+})
+
+test('edge proof rejects wrong bucket commitment', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b'), b('d')])
+
+  const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
+  proof.bucketCommitment = ptToBytes(vertexBucketCommitment(1, [b('x')]))
+
+  invalid(RankedLog.verifyEdge(log.state(), proof))
+})
+
+test('vertex proof rejects wrong bucket commitment', () => {
   const log = new RankedLog()
   log.append(b('a'))
-  log.appendLayer([b('b'), b('c')])
-  log.append(b('d'))
 
-  const proof = log.proveEntry({ rank: 2, value: b('b') })
-  proof.adjustments[0].multiplicity = 3
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  proof.bucketCommitment = ptToBytes(vertexBucketCommitment(1, [b('x')]))
 
-  invalid(RankedLog.verifyEntry(log.state(), proof))
+  invalid(RankedLog.verifyVertex(log.state(), proof))
+})
+
+test('vertex proof rejects tampered bucket digest', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  proof.bucketDigest = fmod(proof.bucketDigest + 1n)
+
+  invalid(RankedLog.verifyVertex(log.state(), proof))
+})
+
+test('edge proof rejects tampered bucket digest', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b')])
+
+  const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
+  proof.bucketDigest = fmod(proof.bucketDigest + 1n)
+
+  invalid(RankedLog.verifyEdge(log.state(), proof))
+})
+
+test('vertex proof rejects tampered outer opening', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  proof.outerOpening.finalScalar = fmod(proof.outerOpening.finalScalar + 1n)
+
+  invalid(RankedLog.verifyVertex(log.state(), proof))
+})
+
+test('edge proof rejects tampered outer opening', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b')])
+
+  const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
+  proof.outerOpening.finalScalar = fmod(proof.outerOpening.finalScalar + 1n)
+
+  invalid(RankedLog.verifyEdge(log.state(), proof))
+})
+
+test('proof rejects inconsistent state commitment slices', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b')])
+
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  const state = log.state()
+  state.edgeCommitment = log.rankCommitment()
+
+  invalid(RankedLog.verifyVertex(state, proof))
 })
 
 test('proof does not verify against a different commitment', () => {
@@ -330,8 +537,8 @@ test('proof does not verify against a different commitment', () => {
   const other = new RankedLog()
   other.append(b('x'))
 
-  const proof = log.proveEntry({ rank: 1, value: b('a') })
-  invalid(RankedLog.verifyEntry(other.state(), proof))
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  invalid(RankedLog.verifyVertex(other.state(), proof))
 })
 
 test('proof does not trust its embedded state', () => {
@@ -341,10 +548,10 @@ test('proof does not trust its embedded state', () => {
   const other = new RankedLog()
   other.append(b('x'))
 
-  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.state = other.state()
 
-  invalid(RankedLog.verifyEntry(other.state(), proof))
+  invalid(RankedLog.verifyVertex(other.state(), proof))
 })
 
 test('mutated proof rank fails', () => {
@@ -352,10 +559,10 @@ test('mutated proof rank fails', () => {
   log.append(b('a'))
   log.append(b('b'))
 
-  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.rank = 2
 
-  invalid(RankedLog.verifyEntry(log.state(), proof))
+  invalid(RankedLog.verifyVertex(log.state(), proof))
 })
 
 test('mutated proof value fails', () => {
@@ -363,10 +570,10 @@ test('mutated proof value fails', () => {
   log.append(b('a'))
   log.append(b('b'))
 
-  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.value = b('x')
 
-  invalid(RankedLog.verifyEntry(log.state(), proof))
+  invalid(RankedLog.verifyVertex(log.state(), proof))
 })
 
 test('mutated IPA opening fails', () => {
@@ -374,31 +581,49 @@ test('mutated IPA opening fails', () => {
   log.append(b('a'))
   log.append(b('b'))
 
-  const proof = log.proveEntry({ rank: 1, value: b('a') })
-  proof.opening.finalScalar = proof.opening.finalScalar + 1n
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  proof.innerOpening.finalScalar = fmod(proof.innerOpening.finalScalar + 1n)
 
-  invalid(RankedLog.verifyEntry(log.state(), proof))
+  invalid(RankedLog.verifyVertex(log.state(), proof))
 })
 
-test('stale proof fails after expected state advances', () => {
+test('stale vertex proof fails after expected state advances', () => {
   const log = new RankedLog()
   log.append(b('a'))
 
-  const proof = log.proveEntry({ rank: 1, value: b('a') })
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
   log.append(b('b'))
 
-  invalid(RankedLog.verifyEntry(log.state(), proof))
+  invalid(RankedLog.verifyVertex(log.state(), proof))
 })
 
-test('commitment-only state is enough to verify inclusion witness', () => {
+test('stale edge proof fails after expected state advances', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b')])
+
+  const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
+  log.append(b('c'))
+
+  invalid(RankedLog.verifyEdge(log.state(), proof))
+})
+
+test('commitment-only state is enough to verify vertex membership', () => {
   const log = new RankedLog()
   log.append(b('a'))
 
-  const proof = log.proveEntry({ rank: 1, value: b('a') })
-  valid(RankedLog.verifyEntry(log.rankCommitment(), proof))
+  const proof = log.proveVertex({ rank: 1, value: b('a') })
+  valid(RankedLog.verifyVertex(log.commitment(), proof))
 })
 
-console.log('\n── Suite 4: Serialization and Helpers ──────────────────')
+test('commitment-only state is enough to verify edge membership', () => {
+  const log = new RankedLog()
+  log.addBranch([b('a'), b('b')])
+
+  const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
+  valid(RankedLog.verifyEdge(log.commitment(), proof))
+})
+
+console.log('\n── Suite 5: Serialization and Helpers ──────────────────')
 
 test('toJSON / fromJSON round trip preserves state', () => {
   const log = new RankedLog()
@@ -419,10 +644,10 @@ test('restored log verifies original proof', () => {
   log.append(b('a'))
   log.append(b('b'))
 
-  const proof = log.proveEntry({ rank: 2, value: b('b') })
+  const proof = log.proveVertex({ rank: 2, value: b('b') })
   const restored = RankedLog.fromJSON(log.toJSON())
 
-  valid(restored.verifyEntry(proof))
+  valid(restored.verifyVertex(proof))
 })
 
 test('fromJSON rejects mismatched commitment', () => {
@@ -458,6 +683,7 @@ test('rank generator binds rank, not append position', () => {
   assert(!ptEq(rank1, rank2), 'same bytes at different ranks should use different generators')
 })
 
-console.log(`\n${'─'.repeat(50)}`)
+console.log('\n──────────────────────────────────────────────────')
 console.log(`Results: ${passed} passed, ${failed} failed`)
+
 if (failed > 0) process.exit(1)
