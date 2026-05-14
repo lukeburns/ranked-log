@@ -1,9 +1,9 @@
 {
-  "name": "ranked-log",
+  "name": "causal-log",
   "version": "0.0.1",
-  "description": "",
-  "license": "ISC",
-  "author": "",
+  "description": "An append-only, multiply-branched log.",
+  "license": "0BSD",
+  "author": "Luke Burns",
   "type": "commonjs",
   "main": "index.js",
   "scripts": {

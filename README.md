@@ -1,134 +1,94 @@
-# Ranked Log
+# Causal Log
 
-An append-only, multiply-branched log.
+An append-only, multiply-branched log with sparse verification.
 
 ## Example
 
 ```js
-const { RankedLog } = require('.')
+const { CausalLog } = require('.')
 
-const log = new RankedLog()
+const log = new CausalLog()
 
 log.append('a')
-log.append('b')
+log.appendLayer(['b', 'c'])
 log.append('d')
 
-const state = log.state()
-const proof = log.proveEntry({ rank: 2, value: 'b' })
+const vertexProof = log.proveVertex({ rank: 2, value: 'b' })
+const edgeProof = log.proveEdge({ fromRank: 2, from: 'b', toRank: 3, to: 'd' })
 
-console.log(state.commitment.toString('hex'))
-console.log(RankedLog.verifyEntry(state, proof)) // { valid: true, reason: 'OK' }
+console.log(CausalLog.verifyVertex(log.state(), vertexProof)) // { valid: true, reason: 'OK' }
+console.log(CausalLog.verifyEdge(log.state(), edgeProof)) // { valid: true, reason: 'OK' }
 ```
 
-The same proof API also works for a forked rank. The rank bucket is committed as
-an IPA polynomial set, so membership is opened without sending complement
-entries:
+Branch-wise construction commits to the same state because vertices and edges are unioned as sets:
 
 ```js
-const forked = new RankedLog()
-forked.append('a')
-forked.appendLayer(['b', 'c'])
-forked.append('d')
-
-const proof = forked.proveEntry({ rank: 2, value: 'b' })
-
-console.log(proof.degree) // 2
-console.log(RankedLog.verifyEntry(forked.state(), proof)) // { valid: true, reason: 'OK' }
-```
-
-Edges have the same membership proof shape:
-
-```js
-const proof = forked.proveEdge({ fromRank: 2, from: 'b', toRank: 3, to: 'd' })
-
-console.log(RankedLog.verifyEdge(forked.state(), proof)) // { valid: true, reason: 'OK' }
-```
-
-Branch-wise construction commits to the same state:
-
-```js
-const left = new RankedLog()
+const left = new CausalLog()
 left.addBranch(['a', 'b', 'd'])
 
-const right = new RankedLog()
+const right = new CausalLog()
 right.addBranch(['a', 'c', 'd'])
 
 const merged = left.clone().merge(right)
 
-console.log(merged.commitment().equals(forked.commitment())) // true
+console.log(merged.commitment().equals(log.commitment())) // true
 ```
 
 ## API
 
-#### `const log = new RankedLog([options])`
+#### `const log = new CausalLog([options])`
 
-Make a new ranked log.
+Create a causal log.
 
-`options.entries` may be used to reconstruct a log from entries:
+`options.vertices` and `options.edges` may be used to reconstruct a log:
 
 ```js
-const log = new RankedLog({
-  entries: [
+const log = new CausalLog({
+  vertices: [
     { rank: 1, value: Buffer.from('a') },
     { rank: 2, value: Buffer.from('b') }
+  ],
+  edges: [
+    { fromRank: 1, from: Buffer.from('a'), toRank: 2, to: Buffer.from('b') }
   ]
 })
 ```
 
-#### `const entry = log.append(bytes)`
+#### `const vertex = log.append(bytes)`
 
-Append one entry at `log.maxRank + 1`.
-
-Returns `{ rank, value, added }`.
+Append one vertex at `log.maxRank + 1`.
 
 #### `const layer = log.appendLayer(bytesArray)`
 
-Append multiple entries at `log.maxRank + 1`.
+Append multiple vertices at `log.maxRank + 1`. Vertices in a layer are deduped by byte value.
 
-Entries in a layer are deduped by byte value. The layer contribution is:
+#### `const vertex = log.addVertex(rank, bytes)`
 
-```text
-H(CommitSet(V_rank)) * G(rank, rank)
-```
-
-#### `const entry = log.addAtRank(rank, bytes)`
-
-Add an entry at an explicit rank. This is useful for importing, reconstructing, or
-building custom ranked layers.
-
-#### `const entries = log.addBranch(bytesArray, [startRank])`
-
-Add a linear branch and its graph edges. This is useful when branch continuity
-matters.
+Add a vertex at an explicit rank.
 
 #### `const edge = log.addEdge(fromRank, from, toRank, to)`
 
-Add an explicit graph edge. The edge contributes to bucket `E_fromRank,toRank`
-and uses generator `G(fromRank, toRank)`.
+Add an explicit graph edge. Edges must point to a later rank, but they do not need to be adjacent.
+
+#### `const vertices = log.addBranch(bytesArray, [startRank])`
+
+Add a linear branch and its edges.
 
 #### `log.merge(other)`
 
-Merge another ranked log or `{ entries, edges }` object into this log.
-
-Entries are unioned by `(rank, bytes)` and edges are unioned by `(from, to)`, so
-shared prefixes and suffixes dedupe.
+Merge another causal log or `{ vertices, edges }` object. Vertices are unioned by `(rank, bytes)`, and edges are unioned by `(fromRank, from, toRank, to)`.
 
 #### `const commitment = log.commitment()`
 
-Return the compressed full commitment as a `Buffer`.
-
-The full commitment is the sum of `log.rankCommitment()` and
-`log.edgeCommitment()`.
+Return the compressed full graph commitment as a `Buffer`.
 
 #### `const commitment = log.vertexCommitment()`
 
-Return the compressed diagonal vertex commitment as a `Buffer`.
-
-`log.rankCommitment()` is an alias for this diagonal commitment.
+Return the compressed diagonal vertex-set commitment.
 
 #### `const commitment = log.edgeCommitment()`
 
-Return the compressed edge/continuity commitment as a `Buffer`.
+Return the compressed edge-set commitment.
 
 #### `const state = log.state()`
 
@@ -137,24 +97,21 @@ Return:
 ```js
 {
   commitment,
-  rankCommitment,
   vertexCommitment,
   edgeCommitment,
   maxRank,
-  entryCount,
+  vertexCount,
   byteLength
 }
 ```
 
 #### `const values = log.layer(rank)`
 
-Return the byte values at `rank`, sorted deterministically.
+Return vertex byte values at `rank`, sorted deterministically.
 
 #### `const vertices = log.vertices()`
 
-Return all vertices as `{ rank, value }` objects, sorted by rank and then value.
-
-`log.entries()` is an alias for this vertex list.
+Return all vertices as `{ rank, value }` objects.
 
 #### `const edges = log.edges()`
 
@@ -164,49 +121,35 @@ Return graph edges as `{ fromRank, from, toRank, to }` objects.
 
 Create an unsigned IPA set-membership proof for a vertex.
 
-`log.proveEntry()` is an alias for vertex proofs.
-
 #### `const proof = log.proveEdge({ fromRank, from, toRank, to })`
 
 Create an unsigned IPA set-membership proof for an edge.
 
-Each membership proof has two openings:
-
-```text
-outer opening: H(bucketCommitment) is opened at graph coordinate G(i,j)
-inner opening: P_bucket(h(element)) = 0 is opened against bucketCommitment
-```
-
-#### `const result = RankedLog.verifyVertex(state, proof)`
+#### `const result = CausalLog.verifyVertex(state, proof)`
 
 Verify a vertex proof against an expected state or commitment.
 
-`RankedLog.verifyEntry()` is an alias for vertex verification.
-
-#### `const result = RankedLog.verifyEdge(state, proof)`
+#### `const result = CausalLog.verifyEdge(state, proof)`
 
 Verify an edge proof against an expected state or commitment.
 
-Returns `{ valid, reason }`.
-
 #### `const json = log.toJSON()`
 
-Serialize a ranked log.
+Serialize a causal log.
 
-#### `const log = RankedLog.fromJSON(json)`
+#### `const log = CausalLog.fromJSON(json)`
 
-Restore a ranked log and check that the serialized commitment matches the entries.
+Restore a causal log and check that the serialized commitment matches the vertices and edges.
 
 ## Commitment
 
-We use a graph-specific double sum over IPA set buckets.
-
-Let `V_i` be the vertices at rank `i`, and let `E_i,j` be the edges from rank
-`i` to rank `j`.
+Let `V_i` be the vertices at rank `i`, and let `E_i,j` be the directed causal
+edges from rank `i` to rank `j`. Since rank is causal depth, edge buckets are
+only populated for `i < j`; the diagonal is reserved for vertex buckets.
 
 ```text
 C = sum_i H(CommitSet(V_i)) * G(i, i)
-  + sum_i sum_j H(CommitSet(E_i,j)) * G(i, j)
+  + sum_{i<j} H(CommitSet(E_i,j)) * G(i, j)
 ```
 
 Each `CommitSet(S)` is an IPA polynomial commitment to the root polynomial:
@@ -221,32 +164,11 @@ Membership is verified by opening:
 P_S(h(s)) = 0
 ```
 
-The diagonal terms `G(i, i)` commit to vertex sets. Off-diagonal terms `G(i, j)`
-commit to edge sets and graph continuity.
-
-The implementation exposes these slices as:
+Each membership proof has two IPA openings:
 
 ```text
-commitment = rankCommitment + edgeCommitment
+outer opening: H(bucketCommitment) is opened at graph coordinate G(i,j)
+inner opening: P_bucket(h(element)) = 0 is opened against bucketCommitment
 ```
 
-The rank commitment alone cannot distinguish these two histories:
-
-```text
-a | b | d
-a | c | d
-```
-
-and
-
-```text
-a | b
-a | c | d
-```
-
-The edge commitment distinguishes them because the first has both `b -> d` and
-`c -> d`, while the second only has `c -> d`.
-
-Merging is deterministic by unioning bucket elements and recomputing the bucket
-polynomial commitment. This gives compact IPA membership openings, but it is not
-an additive accumulator for set union.
+Merging is deterministic by unioning bucket elements and recomputing bucket polynomial commitments. This gives compact IPA membership openings, but it is not an additive accumulator for set union.

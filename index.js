@@ -10,7 +10,7 @@ const Fr = Point.Fn
 const ZERO = Point.ZERO
 const POINT_SIZE = 32
 
-const DOMAIN_ENTRY = b4a.from('hyperdag:entry:v1')
+const DOMAIN_VERTEX = b4a.from('hyperdag:vertex:v1')
 const DOMAIN_GENERATOR = b4a.from('hyperdag:coordinate-generator:v1')
 const DOMAIN_INNER_PRODUCT = b4a.from('hyperdag:inner-product-generator:v1')
 const DOMAIN_SCALAR = b4a.from('hyperdag:scalar:v1')
@@ -51,10 +51,6 @@ function hashToScalar (value, domain = DOMAIN_SCALAR) {
   const bytes = normalizeBytes(value)
   const input = b4a.concat([domain, uint64be(bytes.length), bytes])
   return fmod(BigInt('0x' + bytesToHex(sha256(input))))
-}
-
-function hashEntry (value) {
-  return hashToScalar(value, DOMAIN_ENTRY)
 }
 
 const genCache = new Map()
@@ -138,12 +134,12 @@ function ptFromBytes (bytes) {
   return Point.fromHex(bytesToHex(b))
 }
 
-function entryKey (bytes) {
+function valueKey (bytes) {
   return bytesToHex(bytes)
 }
 
 function edgeKey (fromRank, from, toRank, to) {
-  return `${fromRank}:${entryKey(from)}>${toRank}:${entryKey(to)}`
+  return `${fromRank}:${valueKey(from)}>${toRank}:${valueKey(to)}`
 }
 
 function challenge (...args) {
@@ -180,22 +176,17 @@ function stateCommitment (state) {
   if (!state || !state.commitment) throw new Error('expected state must include a commitment')
   return {
     commitment: b4a.from(state.commitment),
-    rankCommitment: state.rankCommitment && b4a.from(state.rankCommitment),
     vertexCommitment: state.vertexCommitment && b4a.from(state.vertexCommitment),
     edgeCommitment: state.edgeCommitment && b4a.from(state.edgeCommitment),
-    transitionCommitment: state.transitionCommitment && b4a.from(state.transitionCommitment),
     maxRank: state.maxRank,
-    entryCount: state.entryCount,
+    vertexCount: state.vertexCount,
     byteLength: state.byteLength
   }
 }
 
 function verifyStateSlices (expected) {
-  const vertexCommitment = expected.vertexCommitment || expected.rankCommitment
-  const edgeCommitment = expected.edgeCommitment || expected.transitionCommitment
-
-  if (vertexCommitment && edgeCommitment) {
-    const combined = ptAdd(ptFromBytes(vertexCommitment), ptFromBytes(edgeCommitment))
+  if (expected.vertexCommitment && expected.edgeCommitment) {
+    const combined = ptAdd(ptFromBytes(expected.vertexCommitment), ptFromBytes(expected.edgeCommitment))
     if (!b4a.from(ptToBytes(combined)).equals(expected.commitment)) {
       return { valid: false, reason: 'state commitment mismatch' }
     }
@@ -212,11 +203,7 @@ function sameBytes (a, b) {
   return b4a.from(a).equals(b4a.from(b))
 }
 
-function termForEntry (rank, value) {
-  return termForLayer(rank, [value])
-}
-
-function termForLayer (rank, values) {
+function termForVertexBucket (rank, values) {
   return ptScale(vertexBucketScalar(rank, values), generator(rank))
 }
 
@@ -250,7 +237,7 @@ function elementScalarForVertex (rank, value) {
       uint64be(bytes.length),
       bytes
     ]),
-    DOMAIN_ENTRY
+    DOMAIN_VERTEX
   )
 }
 
@@ -317,7 +304,7 @@ function vertexBucketCommitment (rank, values) {
   const unique = new Map()
   for (const value of values) {
     const bytes = normalizeBytes(value)
-    unique.set(entryKey(bytes), bytes)
+    unique.set(valueKey(bytes), bytes)
   }
 
   const roots = [...unique.values()].map(value => elementScalarForVertex(rank, value))
@@ -331,7 +318,7 @@ function vertexBucketPolynomial (rank, values) {
   const unique = new Map()
   for (const value of values) {
     const bytes = normalizeBytes(value)
-    unique.set(entryKey(bytes), bytes)
+    unique.set(valueKey(bytes), bytes)
   }
 
   const roots = [...unique.values()].map(value => elementScalarForVertex(rank, value))
@@ -415,13 +402,6 @@ function edgeBucketScalar (fromRank, toRank, edges) {
   return bucketDigest(edgeBucketCommitment(fromRank, toRank, edges))
 }
 
-function edgeLayerScalar (edges) {
-  if (!Array.isArray(edges) || edges.length === 0) throw new Error('edge bucket must contain at least one edge')
-
-  const first = edges[0]
-  return edgeBucketScalar(validateRank(first.fromRank), validateRank(first.toRank), edges)
-}
-
 function termForEdgeBucket (fromRank, toRank, edges) {
   fromRank = validateRank(fromRank)
   toRank = validateRank(toRank)
@@ -456,16 +436,6 @@ function nextPow2 (n) {
   let p = 1
   while (p < n) p *= 2
   return p
-}
-
-function vectorLength (maxRank) {
-  return nextPow2(Math.max(1, maxRank))
-}
-
-function rankGenerators (length) {
-  const gens = []
-  for (let rank = 1; rank <= length; rank++) gens.push(generator(rank))
-  return gens
 }
 
 function graphVectorLength (maxRank) {
@@ -504,26 +474,10 @@ function graphGenerators (maxRank, length = graphVectorLength(maxRank)) {
   return gens
 }
 
-function rankBasis (rank, length) {
-  const basis = new Array(length).fill(0n)
-  basis[rank - 1] = 1n
-  return basis
-}
-
 function coordinateBasis (i, j, maxRank, length = graphVectorLength(maxRank)) {
   const basis = new Array(length).fill(0n)
   basis[graphCoordinateIndex(i, j, maxRank)] = 1n
   return basis
-}
-
-function vectorScalarsFromLayers (layers, maxRank) {
-  const scalars = new Array(vectorLength(maxRank)).fill(0n)
-
-  for (const [rank, layer] of layers) {
-    scalars[rank - 1] = vertexBucketScalar(rank, [...layer.values()])
-  }
-
-  return scalars
 }
 
 function graphScalarsFromBuckets (layers, edges, maxRank) {
@@ -637,37 +591,6 @@ function ipaVerifyInnerProduct (commitment, basis, valueScalar, proof, generator
   return { valid: true, reason: 'OK' }
 }
 
-function ipaProveOpening (commitment, scalars, rank, valueScalar) {
-  const length = scalars.length
-  return ipaProveInnerProduct(
-    commitment,
-    scalars,
-    rankBasis(rank, length),
-    valueScalar,
-    rankGenerators(length)
-  )
-}
-
-function ipaVerifyOpening (commitment, rank, valueScalar, proof) {
-  if (!proof || !Number.isSafeInteger(proof.length) || proof.length < 1) {
-    return { valid: false, reason: 'invalid IPA proof length' }
-  }
-  if (proof.length !== vectorLength(proof.maxRank)) {
-    return { valid: false, reason: 'invalid IPA proof dimension' }
-  }
-  if (rank > proof.maxRank || rank < 1) {
-    return { valid: false, reason: 'rank outside proof dimension' }
-  }
-
-  return ipaVerifyInnerProduct(
-    commitment,
-    rankBasis(rank, proof.length),
-    valueScalar,
-    proof,
-    rankGenerators(proof.length)
-  )
-}
-
 function ipaProveCoordinateOpening (commitment, scalars, i, j, maxRank, valueScalar) {
   const length = graphVectorLength(maxRank)
   if (scalars.length !== length) throw new Error('invalid graph scalar dimension')
@@ -725,13 +648,13 @@ function ipaVerifyPolynomialEvaluation (i, j, bucketCommitment, x, valueScalar, 
   )
 }
 
-function commitmentForEntries (entries) {
+function commitmentForVertices (vertices) {
   const layers = new Map()
 
-  for (const entry of entries) {
-    const rank = validateRank(entry.rank)
-    const bytes = normalizeBytes(entry.value)
-    const key = entryKey(bytes)
+  for (const vertex of vertices) {
+    const rank = validateRank(vertex.rank)
+    const bytes = normalizeBytes(vertex.value)
+    const key = valueKey(bytes)
     let layer = layers.get(rank)
 
     if (!layer) {
@@ -745,7 +668,7 @@ function commitmentForEntries (entries) {
   let commitment = ZERO
 
   for (const rank of [...layers.keys()].sort((a, b) => a - b)) {
-    commitment = ptAdd(commitment, termForLayer(rank, [...layers.get(rank).values()]))
+    commitment = ptAdd(commitment, termForVertexBucket(rank, [...layers.get(rank).values()]))
   }
 
   return commitment
@@ -783,7 +706,7 @@ function commitmentForEdges (edges) {
   return commitment
 }
 
-class RankedLog {
+class CausalLog {
   constructor (opts = {}) {
     this._layers = new Map()
     this._vertexCommitment = ZERO
@@ -791,31 +714,28 @@ class RankedLog {
     this._edges = new Map()
     this._frontier = []
     this.maxRank = 0
-    this.entryCount = 0
+    this.vertexCount = 0
     this.byteLength = 0
 
-    if (opts.entries) {
-      for (const entry of opts.entries) {
-        this.addAtRank(entry.rank, entry.value)
+    if (opts.vertices) {
+      for (const vertex of opts.vertices) {
+        this.addVertex(vertex.rank, vertex.value)
       }
     }
-    const edges = opts.edges || opts.transitions
-    if (edges) {
-      for (const edge of edges) {
-        this.addEdge(edge.fromRank, edge.from, edge.toRank, edge.to)
-      }
+    if (opts.edges) {
+      for (const edge of opts.edges) this.addEdge(edge.fromRank, edge.from, edge.toRank, edge.to)
     }
   }
 
   append (value) {
     const previous = this._frontier
     const rank = this.maxRank + 1
-    const entry = this.addAtRank(rank, value)
+    const vertex = this.addVertex(rank, value)
 
-    this._connect(previous, [entry])
-    this._frontier = [{ rank, value: b4a.from(entry.value) }]
+    this._connect(previous, [vertex])
+    this._frontier = [{ rank, value: b4a.from(vertex.value) }]
 
-    return entry
+    return vertex
   }
 
   appendLayer (values) {
@@ -825,8 +745,8 @@ class RankedLog {
     const added = []
 
     for (const value of values) {
-      const entry = this.addAtRank(rank, value)
-      if (entry.added) added.push(entry)
+      const vertex = this.addVertex(rank, value)
+      if (vertex.added) added.push(vertex)
     }
 
     this._connect(previous, added)
@@ -839,22 +759,22 @@ class RankedLog {
     if (!Array.isArray(values)) throw new TypeError('values must be an array')
     startRank = validateRank(startRank)
 
-    const entries = values.map((value, i) => {
+    const vertices = values.map((value, i) => {
       const rank = startRank + i
-      return this.addAtRank(rank, value)
+      return this.addVertex(rank, value)
     })
 
-    for (let i = 1; i < entries.length; i++) {
-      this.addEdge(entries[i - 1].rank, entries[i - 1].value, entries[i].rank, entries[i].value)
+    for (let i = 1; i < vertices.length; i++) {
+      this.addEdge(vertices[i - 1].rank, vertices[i - 1].value, vertices[i].rank, vertices[i].value)
     }
 
-    return entries
+    return vertices
   }
 
-  addAtRank (rank, value) {
+  addVertex (rank, value) {
     rank = validateRank(rank)
     const bytes = normalizeBytes(value)
-    const key = entryKey(bytes)
+    const key = valueKey(bytes)
     let layer = this._layers.get(rank)
 
     if (!layer) {
@@ -868,15 +788,11 @@ class RankedLog {
 
     layer.set(key, bytes)
     this.maxRank = Math.max(this.maxRank, rank)
-    this.entryCount++
+    this.vertexCount++
     this.byteLength += bytes.length
     this._recomputeCommitments()
 
     return { rank, value: b4a.from(bytes), added: true }
-  }
-
-  addVertex (rank, value) {
-    return this.addAtRank(rank, value)
   }
 
   addEdge (fromRank, from, toRank, to) {
@@ -887,8 +803,8 @@ class RankedLog {
     from = normalizeBytes(from, 'from')
     to = normalizeBytes(to, 'to')
 
-    if (!this.has(fromRank, from)) this.addAtRank(fromRank, from)
-    if (!this.has(toRank, to)) this.addAtRank(toRank, to)
+    if (!this.has(fromRank, from)) this.addVertex(fromRank, from)
+    if (!this.has(toRank, to)) this.addVertex(toRank, to)
 
     const bucketKey = coordinateKey(fromRank, toRank)
     let bucket = this._edges.get(bucketKey)
@@ -907,14 +823,10 @@ class RankedLog {
     return { ...edge, added: true }
   }
 
-  addTransition (fromRank, from, toRank, to) {
-    return this.addEdge(fromRank, from, toRank, to)
-  }
-
   has (rank, value) {
     rank = validateRank(rank)
     const layer = this._layers.get(rank)
-    return !!layer && layer.has(entryKey(normalizeBytes(value)))
+    return !!layer && layer.has(valueKey(normalizeBytes(value)))
   }
 
   layer (rank) {
@@ -926,14 +838,10 @@ class RankedLog {
       .map(([, value]) => b4a.from(value))
   }
 
-  entries () {
+  vertices () {
     return [...this._layers.keys()]
       .sort((a, b) => a - b)
       .flatMap(rank => this.layer(rank).map(value => ({ rank, value })))
-  }
-
-  vertices () {
-    return this.entries()
   }
 
   edges () {
@@ -978,19 +886,13 @@ class RankedLog {
     return bucket.edges.has(edgeKey(fromRank, normalizeBytes(from, 'from'), toRank, normalizeBytes(to, 'to')))
   }
 
-  transitions () {
-    return this.edges()
-  }
-
   merge (other) {
-    const entries = other instanceof RankedLog ? other.entries() : other.entries
-    if (!Array.isArray(entries)) throw new TypeError('merge target must expose entries')
+    const vertices = other instanceof CausalLog ? other.vertices() : other.vertices
+    if (!Array.isArray(vertices)) throw new TypeError('merge target must expose vertices')
 
-    for (const entry of entries) {
-      this.addAtRank(entry.rank, entry.value)
-    }
+    for (const vertex of vertices) this.addVertex(vertex.rank, vertex.value)
 
-    const edges = other instanceof RankedLog ? other.edges() : (other.edges || other.transitions)
+    const edges = other instanceof CausalLog ? other.edges() : other.edges
     if (edges) {
       if (!Array.isArray(edges)) throw new TypeError('merge edges must be an array')
       for (const edge of edges) {
@@ -1002,7 +904,7 @@ class RankedLog {
   }
 
   clone () {
-    return new RankedLog({ entries: this.entries(), edges: this.edges() })
+    return new CausalLog({ vertices: this.vertices(), edges: this.edges() })
   }
 
   commitmentPoint () {
@@ -1013,16 +915,8 @@ class RankedLog {
     return this._vertexCommitment
   }
 
-  rankCommitmentPoint () {
-    return this.vertexCommitmentPoint()
-  }
-
   edgeCommitmentPoint () {
     return this._edgeCommitment
-  }
-
-  transitionCommitmentPoint () {
-    return this.edgeCommitmentPoint()
   }
 
   commitment () {
@@ -1033,27 +927,17 @@ class RankedLog {
     return b4a.from(ptToBytes(this._vertexCommitment))
   }
 
-  rankCommitment () {
-    return this.vertexCommitment()
-  }
-
   edgeCommitment () {
     return b4a.from(ptToBytes(this._edgeCommitment))
-  }
-
-  transitionCommitment () {
-    return this.edgeCommitment()
   }
 
   state () {
     return {
       commitment: this.commitment(),
-      rankCommitment: this.rankCommitment(),
       vertexCommitment: this.vertexCommitment(),
       edgeCommitment: this.edgeCommitment(),
-      transitionCommitment: this.edgeCommitment(),
       maxRank: this.maxRank,
-      entryCount: this.entryCount,
+      vertexCount: this.vertexCount,
       byteLength: this.byteLength
     }
   }
@@ -1063,7 +947,7 @@ class RankedLog {
     rank = validateRank(rank)
 
     if (!this.has(rank, target)) {
-      throw new Error('entry is not present in ranked log')
+      throw new Error('vertex is not present in causal log')
     }
 
     const bucket = vertexBucketPolynomial(rank, this.layer(rank))
@@ -1086,10 +970,6 @@ class RankedLog {
     }
   }
 
-  proveEntry (opts) {
-    return this.proveVertex(opts)
-  }
-
   proveEdge ({ fromRank, from, toRank, to }) {
     fromRank = validateRank(fromRank)
     toRank = validateRank(toRank)
@@ -1097,7 +977,7 @@ class RankedLog {
     to = normalizeBytes(to, 'to')
 
     if (!this.hasEdge(fromRank, from, toRank, to)) {
-      throw new Error('edge is not present in ranked log')
+      throw new Error('edge is not present in causal log')
     }
 
     const bucket = edgeBucketPolynomial(fromRank, toRank, this.edgeBucket(fromRank, toRank))
@@ -1120,27 +1000,23 @@ class RankedLog {
     }
   }
 
-  verifyEntry (proof) {
-    return RankedLog.verifyVertex(this.state(), proof)
-  }
-
   verifyVertex (proof) {
-    return RankedLog.verifyVertex(this.state(), proof)
+    return CausalLog.verifyVertex(this.state(), proof)
   }
 
   verifyEdge (proof) {
-    return RankedLog.verifyEdge(this.state(), proof)
+    return CausalLog.verifyEdge(this.state(), proof)
   }
 
   toJSON () {
     return {
       maxRank: this.maxRank,
-      entryCount: this.entryCount,
+      vertexCount: this.vertexCount,
       byteLength: this.byteLength,
       commitment: bytesToHex(this.commitment()),
-      entries: this.entries().map(entry => ({
-        rank: entry.rank,
-        value: bytesToHex(entry.value)
+      vertices: this.vertices().map(vertex => ({
+        rank: vertex.rank,
+        value: bytesToHex(vertex.value)
       })),
       edges: this.edges().map(edge => ({
         fromRank: edge.fromRank,
@@ -1162,17 +1038,17 @@ class RankedLog {
   }
 
   _recomputeCommitments () {
-    this._vertexCommitment = commitmentForEntries(this.entries())
+    this._vertexCommitment = commitmentForVertices(this.vertices())
     this._edgeCommitment = commitmentForEdges(this.edges())
   }
 
   static fromJSON (json) {
-    const log = new RankedLog({
-      entries: json.entries.map(entry => ({
-        rank: entry.rank,
-        value: b4a.from(hexToBytes(entry.value))
+    const log = new CausalLog({
+      vertices: json.vertices.map(vertex => ({
+        rank: vertex.rank,
+        value: b4a.from(hexToBytes(vertex.value))
       })),
-      edges: (json.edges || json.transitions || []).map(edge => ({
+      edges: (json.edges || []).map(edge => ({
         fromRank: edge.fromRank,
         from: b4a.from(hexToBytes(edge.from)),
         toRank: edge.toRank,
@@ -1182,7 +1058,7 @@ class RankedLog {
 
     const expected = json.commitment && b4a.from(hexToBytes(json.commitment))
     if (expected && !log.commitment().equals(expected)) {
-      throw new Error('serialized commitment does not match entries')
+      throw new Error('serialized commitment does not match vertices and edges')
     }
 
     return log
@@ -1248,10 +1124,6 @@ class RankedLog {
     } catch (err) {
       return { valid: false, reason: err.message }
     }
-  }
-
-  static verifyEntry (expectedState, proof) {
-    return RankedLog.verifyVertex(expectedState, proof)
   }
 
   static verifyEdge (expectedState, proof) {
@@ -1321,62 +1193,55 @@ class RankedLog {
 }
 
 module.exports = {
-  RankedLog,
-  ZERO,
-  POINT_SIZE,
-  commitmentForEntries,
-  commitmentForEdges,
-  challenge,
-  coordinateGenerator,
-  coordinateBasis,
-  elementScalarForVertex,
-  elementScalarForEdge,
-  entryKey,
-  edgeKey,
-  edgeScalar,
-  edgeLayerScalar,
-  edgeBucketScalar,
-  edgeBucketCommitment,
-  edgeBucketPolynomial,
-  evaluatePolynomial,
-  evaluationBasis,
-  fmod,
-  generator,
-  graphScalarsFromBuckets,
-  graphVectorLength,
-  hashEntry,
-  hashToScalar,
-  innerCommit,
-  innerProduct,
-  ipaProveCoordinateOpening,
-  ipaProveInnerProduct,
-  ipaProveOpening,
-  ipaProvePolynomialEvaluation,
-  ipaVerifyCoordinateOpening,
-  ipaVerifyInnerProduct,
-  ipaVerifyOpening,
-  ipaVerifyPolynomialEvaluation,
-  modinv,
-  normalizeBytes,
-  polynomialGenerator,
-  polynomialGenerators,
-  polyCommitment,
-  ptAdd,
-  ptEq,
-  ptFromBytes,
-  ptScale,
-  ptToBytes,
-  rootPolynomial,
-  sameBytes,
-  bucketDigest,
-  termForEntry,
-  termForLayer,
-  termForEdgeBucket,
-  vertexBucketScalar,
-  vertexBucketCommitment,
-  vertexBucketPolynomial,
-  transitionKey: edgeKey,
-  transitionScalar: edgeScalar,
-  transitionLayerScalar: edgeLayerScalar,
-  termForTransitionLayer: termForEdgeBucket
+  CausalLog,
+  _internals: {
+    ZERO,
+    POINT_SIZE,
+    commitmentForVertices,
+    commitmentForEdges,
+    challenge,
+    coordinateGenerator,
+    coordinateBasis,
+    elementScalarForVertex,
+    elementScalarForEdge,
+    valueKey,
+    edgeKey,
+    edgeScalar,
+    edgeBucketScalar,
+    edgeBucketCommitment,
+    edgeBucketPolynomial,
+    evaluatePolynomial,
+    evaluationBasis,
+    fmod,
+    generator,
+    graphScalarsFromBuckets,
+    graphVectorLength,
+    hashToScalar,
+    innerCommit,
+    innerProduct,
+    ipaProveCoordinateOpening,
+    ipaProveInnerProduct,
+    ipaProvePolynomialEvaluation,
+    ipaVerifyCoordinateOpening,
+    ipaVerifyInnerProduct,
+    ipaVerifyPolynomialEvaluation,
+    modinv,
+    normalizeBytes,
+    polynomialGenerator,
+    polynomialGenerators,
+    polyCommitment,
+    ptAdd,
+    ptEq,
+    ptFromBytes,
+    ptScale,
+    ptToBytes,
+    rootPolynomial,
+    sameBytes,
+    bucketDigest,
+    termForVertexBucket,
+    termForEdgeBucket,
+    vertexBucketScalar,
+    vertexBucketCommitment,
+    vertexBucketPolynomial
+  }
 }

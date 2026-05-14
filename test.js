@@ -1,17 +1,17 @@
 'use strict'
 
+const { CausalLog, _internals } = require('./index')
 const {
-  RankedLog,
   bucketDigest,
   commitmentForEdges,
-  commitmentForEntries,
+  commitmentForVertices,
   edgeBucketCommitment,
   elementScalarForEdge,
   elementScalarForVertex,
   evaluatePolynomial,
   fmod,
   generator,
-  hashEntry,
+  hashToScalar,
   ipaProvePolynomialEvaluation,
   ipaVerifyPolynomialEvaluation,
   polyCommitment,
@@ -20,11 +20,10 @@ const {
   ptScale,
   ptToBytes,
   rootPolynomial,
-  termForEntry,
-  termForLayer,
+  termForVertexBucket,
   termForEdgeBucket,
   vertexBucketCommitment
-} = require('./index')
+} = _internals
 const b4a = require('b4a')
 
 let passed = 0
@@ -70,37 +69,37 @@ function b (value) {
   return b4a.from(value)
 }
 
-console.log('\n── Suite 1: Ranked Log Basics ──────────────────────────')
+console.log('\n── Suite 1: Causal Log Basics ──────────────────────────')
 
 test('empty log has zero state', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   const state = log.state()
 
   assertEqual(state.maxRank, 0)
-  assertEqual(state.entryCount, 0)
+  assertEqual(state.vertexCount, 0)
   assertEqual(state.byteLength, 0)
   assertEqual(state.commitment.length, 32)
   assert(state.commitment.every(byte => byte === 0), 'empty commitment should be zero point')
 })
 
 test('append assigns increasing ranks', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   const a = log.append(b('a'))
-  const bEntry = log.append(b('b'))
+  const bVertex = log.append(b('b'))
 
   assertEqual(a.rank, 1)
-  assertEqual(bEntry.rank, 2)
+  assertEqual(bVertex.rank, 2)
   assertEqual(log.maxRank, 2)
-  assertEqual(log.entryCount, 2)
+  assertEqual(log.vertexCount, 2)
   assertEqual(log.byteLength, 2)
 })
 
 test('linear order is rank-sensitive', () => {
-  const ab = new RankedLog()
+  const ab = new CausalLog()
   ab.append(b('a'))
   ab.append(b('b'))
 
-  const ba = new RankedLog()
+  const ba = new CausalLog()
   ba.append(b('b'))
   ba.append(b('a'))
 
@@ -108,12 +107,12 @@ test('linear order is rank-sensitive', () => {
 })
 
 test('same-rank layer is commutative', () => {
-  const bc = new RankedLog()
+  const bc = new CausalLog()
   bc.append(b('a'))
   bc.appendLayer([b('b'), b('c')])
   bc.append(b('d'))
 
-  const cb = new RankedLog()
+  const cb = new CausalLog()
   cb.append(b('a'))
   cb.appendLayer([b('c'), b('b')])
   cb.append(b('d'))
@@ -122,61 +121,61 @@ test('same-rank layer is commutative', () => {
 })
 
 test('a | {b,c} | d matches set-bucket layer construction', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.appendLayer([b('b'), b('c')])
   log.append(b('d'))
 
-  let expected = termForEntry(1, b('a'))
-  expected = expected.add(termForLayer(2, [b('b'), b('c')]))
-  expected = expected.add(termForEntry(3, b('d')))
+  let expected = termForVertexBucket(1, [b('a')])
+  expected = expected.add(termForVertexBucket(2, [b('b'), b('c')]))
+  expected = expected.add(termForVertexBucket(3, [b('d')]))
 
-  assert(ptEq(log.rankCommitmentPoint(), expected), 'rank commitment should use diagonal set buckets')
+  assert(ptEq(log.vertexCommitmentPoint(), expected), 'vertex commitment should use diagonal set buckets')
 })
 
 test('a | {b,c} | d is deterministic with branch-wise union', () => {
-  const segmentWise = new RankedLog()
+  const segmentWise = new CausalLog()
   segmentWise.append(b('a'))
   segmentWise.appendLayer([b('b'), b('c')])
   segmentWise.append(b('d'))
 
-  const branchB = new RankedLog()
+  const branchB = new CausalLog()
   branchB.addBranch([b('a'), b('b'), b('d')])
 
-  const branchC = new RankedLog()
+  const branchC = new CausalLog()
   branchC.addBranch([b('a'), b('c'), b('d')])
 
   const branchWise = branchB.clone().merge(branchC)
 
   assertBufferEqual(segmentWise.commitment(), branchWise.commitment())
-  assertEqual(branchWise.entryCount, 4, 'shared prefix and suffix should dedupe')
+  assertEqual(branchWise.vertexCount, 4, 'shared prefix and suffix should dedupe')
 })
 
 test('manual commitment helper matches log state', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.appendLayer([b('b'), b('c')])
 
-  const expected = commitmentForEntries(log.entries())
-  assertBufferEqual(log.rankCommitment(), ptToBytes(expected))
+  const expected = commitmentForVertices(log.vertices())
+  assertBufferEqual(log.vertexCommitment(), ptToBytes(expected))
 })
 
 test('edge commitment distinguishes branch continuation', () => {
-  const terminated = new RankedLog()
+  const terminated = new CausalLog()
   terminated.addBranch([b('a'), b('b')])
   terminated.addBranch([b('a'), b('c'), b('d')])
 
-  const sharedTail = new RankedLog()
+  const sharedTail = new CausalLog()
   sharedTail.addBranch([b('a'), b('b'), b('d')])
   sharedTail.addBranch([b('a'), b('c'), b('d')])
 
-  assertBufferEqual(terminated.rankCommitment(), sharedTail.rankCommitment())
+  assertBufferEqual(terminated.vertexCommitment(), sharedTail.vertexCommitment())
   assertBufferNotEqual(terminated.edgeCommitment(), sharedTail.edgeCommitment())
   assertBufferNotEqual(terminated.commitment(), sharedTail.commitment())
 })
 
 test('edge commitment matches set-bucket coordinate terms', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.appendLayer([b('b'), b('c')])
   log.append(b('d'))
@@ -195,7 +194,7 @@ test('edge commitment matches set-bucket coordinate terms', () => {
 })
 
 test('explicit edges can occupy non-adjacent coordinate buckets', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addEdge(1, b('a'), 3, b('d'))
 
   const expected = termForEdgeBucket(1, 3, [
@@ -221,62 +220,62 @@ test('edge bucket helper rejects edges from another coordinate', () => {
 
 console.log('\n── Suite 2: Layers, Deduping, and Merge ────────────────')
 
-test('duplicate entries at the same rank are deduped', () => {
-  const withDupes = new RankedLog()
+test('duplicate vertices at the same rank are deduped', () => {
+  const withDupes = new CausalLog()
   withDupes.appendLayer([b('b'), b('b'), b('c')])
 
-  const deduped = new RankedLog()
+  const deduped = new CausalLog()
   deduped.appendLayer([b('b'), b('c')])
 
-  assertEqual(withDupes.entryCount, 2)
+  assertEqual(withDupes.vertexCount, 2)
   assertBufferEqual(withDupes.commitment(), deduped.commitment())
 })
 
-test('same bytes at different ranks are distinct entries', () => {
-  const log = new RankedLog()
+test('same bytes at different ranks are distinct vertices', () => {
+  const log = new CausalLog()
   log.append(b('x'))
   log.append(b('x'))
 
-  assertEqual(log.entryCount, 2)
+  assertEqual(log.vertexCount, 2)
   assertEqual(log.layer(1).length, 1)
   assertEqual(log.layer(2).length, 1)
 })
 
-test('merge is order-independent for disjoint ranked entries', () => {
-  const left = new RankedLog()
-  left.addAtRank(1, b('a'))
-  left.addAtRank(2, b('b'))
+test('merge is order-independent for disjoint ranked vertices', () => {
+  const left = new CausalLog()
+  left.addVertex(1, b('a'))
+  left.addVertex(2, b('b'))
 
-  const right = new RankedLog()
-  right.addAtRank(2, b('c'))
-  right.addAtRank(3, b('d'))
+  const right = new CausalLog()
+  right.addVertex(2, b('c'))
+  right.addVertex(3, b('d'))
 
   const lr = left.clone().merge(right)
   const rl = right.clone().merge(left)
 
   assertBufferEqual(lr.commitment(), rl.commitment())
-  assertEqual(lr.entryCount, 4)
-  assertEqual(rl.entryCount, 4)
+  assertEqual(lr.vertexCount, 4)
+  assertEqual(rl.vertexCount, 4)
 })
 
-test('merge dedupes shared entries', () => {
-  const left = new RankedLog()
-  left.addAtRank(1, b('a'))
-  left.addAtRank(2, b('b'))
+test('merge dedupes shared vertices', () => {
+  const left = new CausalLog()
+  left.addVertex(1, b('a'))
+  left.addVertex(2, b('b'))
 
-  const right = new RankedLog()
-  right.addAtRank(1, b('a'))
-  right.addAtRank(2, b('c'))
+  const right = new CausalLog()
+  right.addVertex(1, b('a'))
+  right.addVertex(2, b('c'))
 
   const merged = left.clone().merge(right)
 
-  assertEqual(merged.entryCount, 3)
+  assertEqual(merged.vertexCount, 3)
   assertEqual(merged.layer(1).length, 1)
   assertEqual(merged.layer(2).length, 2)
 })
 
 test('layer inspection is deterministic', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.appendLayer([b('c'), b('a'), b('b')])
 
   assertEqual(log.layer(1).map(value => value.toString()).join(','), 'a,b,c')
@@ -381,19 +380,18 @@ test('edge bucket commitment dedupes duplicate edges', () => {
 console.log('\n── Suite 4: Unsigned Membership Verification ───────────')
 
 test('valid vertex proof verifies against expected state', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.append(b('b'))
   log.append(b('d'))
 
   const proof = log.proveVertex({ rank: 2, value: b('b') })
-  valid(RankedLog.verifyVertex(log.state(), proof))
+  valid(CausalLog.verifyVertex(log.state(), proof))
   valid(log.verifyVertex(proof))
-  valid(RankedLog.verifyEntry(log.state(), proof))
 })
 
 test('vertex proof for a degenerate layer verifies without complements', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.appendLayer([b('b'), b('c')])
   log.append(b('d'))
@@ -403,11 +401,11 @@ test('vertex proof for a degenerate layer verifies without complements', () => {
   assertEqual(proof.type, 'hyperdag-vertex-membership-proof-v1')
   assertEqual(proof.degree, 2)
   assert(proof.bucketCommitment.length === 32, 'proof should carry bucket commitment')
-  valid(RankedLog.verifyVertex(log.state(), proof))
+  valid(CausalLog.verifyVertex(log.state(), proof))
 })
 
 test('valid edge proof verifies against expected state', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b'), b('d')])
   log.addBranch([b('a'), b('c'), b('d')])
 
@@ -415,243 +413,243 @@ test('valid edge proof verifies against expected state', () => {
 
   assertEqual(proof.type, 'hyperdag-edge-membership-proof-v1')
   assertEqual(proof.degree, 2)
-  valid(RankedLog.verifyEdge(log.state(), proof))
+  valid(CausalLog.verifyEdge(log.state(), proof))
   valid(log.verifyEdge(proof))
 })
 
 test('non-adjacent edge proof verifies against expected state', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addEdge(1, b('a'), 3, b('d'))
 
   const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 3, to: b('d') })
 
   assertEqual(proof.coordinate.toRank, 3)
-  valid(RankedLog.verifyEdge(log.state(), proof))
+  valid(CausalLog.verifyEdge(log.state(), proof))
 })
 
 test('edge proof rejects wrong edge', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b'), b('d')])
 
   const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
   proof.edge.from = b('x')
 
-  invalid(RankedLog.verifyEdge(log.state(), proof))
+  invalid(CausalLog.verifyEdge(log.state(), proof))
 })
 
 test('edge proof rejects wrong target value', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b'), b('d')])
 
   const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
   proof.edge.to = b('x')
 
-  invalid(RankedLog.verifyEdge(log.state(), proof))
+  invalid(CausalLog.verifyEdge(log.state(), proof))
 })
 
 test('edge proof rejects wrong coordinate', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b'), b('d')])
 
   const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
   proof.coordinate.fromRank = 1
 
-  invalid(RankedLog.verifyEdge(log.state(), proof))
+  invalid(CausalLog.verifyEdge(log.state(), proof))
 })
 
 test('edge proof rejects wrong bucket commitment', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b'), b('d')])
 
   const proof = log.proveEdge({ fromRank: 2, from: b('b'), toRank: 3, to: b('d') })
   proof.bucketCommitment = ptToBytes(vertexBucketCommitment(1, [b('x')]))
 
-  invalid(RankedLog.verifyEdge(log.state(), proof))
+  invalid(CausalLog.verifyEdge(log.state(), proof))
 })
 
 test('vertex proof rejects wrong bucket commitment', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.bucketCommitment = ptToBytes(vertexBucketCommitment(1, [b('x')]))
 
-  invalid(RankedLog.verifyVertex(log.state(), proof))
+  invalid(CausalLog.verifyVertex(log.state(), proof))
 })
 
 test('vertex proof rejects tampered bucket digest', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.bucketDigest = fmod(proof.bucketDigest + 1n)
 
-  invalid(RankedLog.verifyVertex(log.state(), proof))
+  invalid(CausalLog.verifyVertex(log.state(), proof))
 })
 
 test('edge proof rejects tampered bucket digest', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b')])
 
   const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
   proof.bucketDigest = fmod(proof.bucketDigest + 1n)
 
-  invalid(RankedLog.verifyEdge(log.state(), proof))
+  invalid(CausalLog.verifyEdge(log.state(), proof))
 })
 
 test('vertex proof rejects tampered outer opening', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.outerOpening.finalScalar = fmod(proof.outerOpening.finalScalar + 1n)
 
-  invalid(RankedLog.verifyVertex(log.state(), proof))
+  invalid(CausalLog.verifyVertex(log.state(), proof))
 })
 
 test('edge proof rejects tampered outer opening', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b')])
 
   const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
   proof.outerOpening.finalScalar = fmod(proof.outerOpening.finalScalar + 1n)
 
-  invalid(RankedLog.verifyEdge(log.state(), proof))
+  invalid(CausalLog.verifyEdge(log.state(), proof))
 })
 
 test('proof rejects inconsistent state commitment slices', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b')])
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
   const state = log.state()
-  state.edgeCommitment = log.rankCommitment()
+  state.edgeCommitment = log.vertexCommitment()
 
-  invalid(RankedLog.verifyVertex(state, proof))
+  invalid(CausalLog.verifyVertex(state, proof))
 })
 
 test('proof does not verify against a different commitment', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
 
-  const other = new RankedLog()
+  const other = new CausalLog()
   other.append(b('x'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
-  invalid(RankedLog.verifyVertex(other.state(), proof))
+  invalid(CausalLog.verifyVertex(other.state(), proof))
 })
 
 test('proof does not trust its embedded state', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
 
-  const other = new RankedLog()
+  const other = new CausalLog()
   other.append(b('x'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.state = other.state()
 
-  invalid(RankedLog.verifyVertex(other.state(), proof))
+  invalid(CausalLog.verifyVertex(other.state(), proof))
 })
 
 test('mutated proof rank fails', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.append(b('b'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.rank = 2
 
-  invalid(RankedLog.verifyVertex(log.state(), proof))
+  invalid(CausalLog.verifyVertex(log.state(), proof))
 })
 
 test('mutated proof value fails', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.append(b('b'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.value = b('x')
 
-  invalid(RankedLog.verifyVertex(log.state(), proof))
+  invalid(CausalLog.verifyVertex(log.state(), proof))
 })
 
 test('mutated IPA opening fails', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.append(b('b'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
   proof.innerOpening.finalScalar = fmod(proof.innerOpening.finalScalar + 1n)
 
-  invalid(RankedLog.verifyVertex(log.state(), proof))
+  invalid(CausalLog.verifyVertex(log.state(), proof))
 })
 
 test('stale vertex proof fails after expected state advances', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
   log.append(b('b'))
 
-  invalid(RankedLog.verifyVertex(log.state(), proof))
+  invalid(CausalLog.verifyVertex(log.state(), proof))
 })
 
 test('stale edge proof fails after expected state advances', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b')])
 
   const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
   log.append(b('c'))
 
-  invalid(RankedLog.verifyEdge(log.state(), proof))
+  invalid(CausalLog.verifyEdge(log.state(), proof))
 })
 
 test('commitment-only state is enough to verify vertex membership', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
 
   const proof = log.proveVertex({ rank: 1, value: b('a') })
-  valid(RankedLog.verifyVertex(log.commitment(), proof))
+  valid(CausalLog.verifyVertex(log.commitment(), proof))
 })
 
 test('commitment-only state is enough to verify edge membership', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.addBranch([b('a'), b('b')])
 
   const proof = log.proveEdge({ fromRank: 1, from: b('a'), toRank: 2, to: b('b') })
-  valid(RankedLog.verifyEdge(log.commitment(), proof))
+  valid(CausalLog.verifyEdge(log.commitment(), proof))
 })
 
 console.log('\n── Suite 5: Serialization and Helpers ──────────────────')
 
 test('toJSON / fromJSON round trip preserves state', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.appendLayer([b('b'), b('c')])
   log.append(b('d'))
 
-  const restored = RankedLog.fromJSON(log.toJSON())
+  const restored = CausalLog.fromJSON(log.toJSON())
 
   assertBufferEqual(restored.commitment(), log.commitment())
   assertEqual(restored.maxRank, log.maxRank)
-  assertEqual(restored.entryCount, log.entryCount)
+  assertEqual(restored.vertexCount, log.vertexCount)
   assertEqual(restored.byteLength, log.byteLength)
 })
 
 test('restored log verifies original proof', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
   log.append(b('b'))
 
   const proof = log.proveVertex({ rank: 2, value: b('b') })
-  const restored = RankedLog.fromJSON(log.toJSON())
+  const restored = CausalLog.fromJSON(log.toJSON())
 
   valid(restored.verifyVertex(proof))
 })
 
 test('fromJSON rejects mismatched commitment', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
 
   const json = log.toJSON()
@@ -659,7 +657,7 @@ test('fromJSON rejects mismatched commitment', () => {
 
   let threw = false
   try {
-    RankedLog.fromJSON(json)
+    CausalLog.fromJSON(json)
   } catch {
     threw = true
   }
@@ -668,7 +666,7 @@ test('fromJSON rejects mismatched commitment', () => {
 })
 
 test('point byte round trip works for commitments', () => {
-  const log = new RankedLog()
+  const log = new CausalLog()
   log.append(b('a'))
 
   const point = ptFromBytes(log.commitment())
@@ -676,7 +674,7 @@ test('point byte round trip works for commitments', () => {
 })
 
 test('rank generator binds rank, not append position', () => {
-  const s = hashEntry(b('x'))
+  const s = hashToScalar(b('x'))
   const rank1 = ptScale(s, generator(1))
   const rank2 = ptScale(s, generator(2))
 
