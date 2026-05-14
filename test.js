@@ -228,19 +228,43 @@ test('valid entry proof verifies against expected state', () => {
   valid(log.verifyEntry(proof))
 })
 
-test('entry proofs reject non-linear layers for now', () => {
+test('entry proof for a degenerate layer verifies with complement witness', () => {
   const log = new RankedLog()
   log.append(b('a'))
   log.appendLayer([b('b'), b('c')])
+  log.append(b('d'))
 
-  let threw = false
-  try {
-    log.proveEntry({ rank: 2, value: b('b') })
-  } catch {
-    threw = true
-  }
+  const proof = log.proveEntry({ rank: 2, value: b('b') })
 
-  assert(threw, 'degenerate layer membership proofs are not implemented yet')
+  assertEqual(proof.adjustments.length, 1)
+  assertEqual(proof.adjustments[0].multiplicity, 2)
+  assertEqual(proof.adjustments[0].complements.length, 1)
+  assertBufferEqual(proof.adjustments[0].complements[0], b('c'))
+  valid(RankedLog.verifyEntry(log.state(), proof))
+})
+
+test('degenerate proof fails with wrong complement', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
+  log.append(b('d'))
+
+  const proof = log.proveEntry({ rank: 2, value: b('b') })
+  proof.adjustments[0].complements[0] = b('x')
+
+  invalid(RankedLog.verifyEntry(log.state(), proof))
+})
+
+test('degenerate proof fails with wrong multiplicity', () => {
+  const log = new RankedLog()
+  log.append(b('a'))
+  log.appendLayer([b('b'), b('c')])
+  log.append(b('d'))
+
+  const proof = log.proveEntry({ rank: 2, value: b('b') })
+  proof.adjustments[0].multiplicity = 3
+
+  invalid(RankedLog.verifyEntry(log.state(), proof))
 })
 
 test('proof does not verify against a different commitment', () => {

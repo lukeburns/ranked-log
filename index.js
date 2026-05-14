@@ -174,6 +174,30 @@ function termForLayer (rank, values) {
   return ptScale(layerScalar(values), generator(rank))
 }
 
+function layerAdjustment (rank, selected, complements) {
+  selected = normalizeBytes(selected, 'selected')
+  if (!Array.isArray(complements)) throw new TypeError('complements must be an array')
+
+  const values = [selected]
+  for (const complement of complements) values.push(normalizeBytes(complement, 'complement'))
+
+  const unique = new Map()
+  for (const value of values) unique.set(entryKey(value), value)
+
+  if (!unique.has(entryKey(selected))) throw new Error('selected value missing from layer')
+  if (unique.size !== values.length) throw new Error('layer adjustment contains duplicate entries')
+
+  const avg = layerScalar([...unique.values()])
+  const delta = fmod(avg - hashEntry(selected))
+
+  return {
+    rank: validateRank(rank),
+    multiplicity: unique.size,
+    delta,
+    term: ptScale(delta, generator(rank))
+  }
+}
+
 function innerProduct (a, b) {
   let sum = 0n
   for (let i = 0; i < a.length; i++) {
@@ -448,19 +472,33 @@ class RankedLog {
     if (!this.has(rank, target)) {
       throw new Error('entry is not present in ranked log')
     }
-    if (this.layer(rank).length !== 1) {
-      throw new Error('entry proofs for non-linear layers are not implemented')
-    }
 
     const valueScalar = hashEntry(target)
     const scalars = vectorScalarsFromLayers(this._layers, this.maxRank)
-    const opening = ipaProveOpening(this._commitment, scalars, rank, valueScalar)
+    const layer = this.layer(rank)
+    const complements = layer.filter(entry => !sameBytes(entry, target))
+    const adjustments = []
+
+    if (complements.length > 0) {
+      const adjustment = layerAdjustment(rank, target, complements)
+      scalars[rank - 1] = valueScalar
+      adjustments.push({
+        rank,
+        selected: b4a.from(target),
+        complements,
+        multiplicity: adjustment.multiplicity
+      })
+    }
+
+    const branchCommitment = innerCommit(scalars, rankGenerators(scalars.length))
+    const opening = ipaProveOpening(branchCommitment, scalars, rank, valueScalar)
 
     return {
-      type: 'hyperdag-linear-entry-proof-v1',
+      type: 'hyperdag-entry-proof-v1',
       rank,
       value: b4a.from(target),
       maxRank: this.maxRank,
+      adjustments,
       opening,
       state: this.state()
     }
@@ -506,7 +544,7 @@ class RankedLog {
   static verifyEntry (expectedState, proof) {
     try {
       const expected = stateCommitment(expectedState)
-      if (!proof || proof.type !== 'hyperdag-linear-entry-proof-v1') {
+      if (!proof || proof.type !== 'hyperdag-entry-proof-v1') {
         return { valid: false, reason: 'unsupported proof' }
       }
 
@@ -522,8 +560,28 @@ class RankedLog {
         return { valid: false, reason: 'maxRank mismatch' }
       }
 
+      let branchCommitment = ptFromBytes(expected.commitment)
+      const adjustments = proof.adjustments || []
+      if (!Array.isArray(adjustments)) return { valid: false, reason: 'invalid adjustments' }
+
+      for (const adjustment of adjustments) {
+        const adjustmentRank = validateRank(adjustment.rank)
+        const selected = normalizeBytes(adjustment.selected, 'selected')
+        const complements = adjustment.complements || []
+        const computed = layerAdjustment(adjustmentRank, selected, complements)
+
+        if (computed.multiplicity !== adjustment.multiplicity) {
+          return { valid: false, reason: 'multiplicity mismatch' }
+        }
+        if (adjustmentRank === rank && !sameBytes(selected, value)) {
+          return { valid: false, reason: 'target adjustment mismatch' }
+        }
+
+        branchCommitment = ptAdd(branchCommitment, ptScale(-1n, computed.term))
+      }
+
       return ipaVerifyOpening(
-        ptFromBytes(expected.commitment),
+        branchCommitment,
         rank,
         hashEntry(value),
         { ...proof.opening, maxRank }
@@ -558,6 +616,7 @@ module.exports = {
   ptToBytes,
   sameBytes,
   layerScalar,
+  layerAdjustment,
   termForEntry,
   termForLayer
 }

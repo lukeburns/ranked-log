@@ -1,4 +1,4 @@
-# HyperDAG
+# Ranked Log
 
 ## Example
 
@@ -18,7 +18,8 @@ console.log(state.commitment.toString('hex'))
 console.log(RankedLog.verifyEntry(state, proof)) // { valid: true, reason: 'OK' }
 ```
 
-Branch-wise construction commits to the same state:
+The same proof API also works for a forked rank by carrying the complement and
+multiplicity for that rank:
 
 ```js
 const forked = new RankedLog()
@@ -26,6 +27,15 @@ forked.append('a')
 forked.appendLayer(['b', 'c'])
 forked.append('d')
 
+const proof = forked.proveEntry({ rank: 2, value: 'b' })
+
+console.log(proof.adjustments[0].multiplicity) // 2
+console.log(RankedLog.verifyEntry(forked.state(), proof)) // { valid: true, reason: 'OK' }
+```
+
+Branch-wise construction commits to the same state:
+
+```js
 const left = new RankedLog()
 left.addAtRank(1, 'a')
 left.addAtRank(2, 'b')
@@ -112,10 +122,12 @@ Return all entries as `{ rank, value }` objects, sorted by rank and then value.
 
 #### `const proof = log.proveEntry({ rank, value })`
 
-Create an unsigned IPA opening proof for an entry in a linear rank.
+Create an unsigned IPA opening proof for an entry.
 
-For now, this only works when `layer(rank)` contains exactly one value. Membership
-proofs for degenerate layers such as `{ b, c }` are not implemented yet.
+For linear ranks, the IPA proof opens the state commitment directly. For forked
+ranks, the proof includes the complement entries and multiplicity for that rank,
+derives the branch commitment where the claim is true, and opens that branch
+commitment.
 
 #### `const result = RankedLog.verifyEntry(state, proof)`
 
